@@ -41,9 +41,16 @@ available_cpus = mp.cpu_count()
 num_workers = max(1, int(available_cpus * 0.9))
 print(f"Detected {available_cpus} CPUs, using {num_workers} worker processes (90%)")
 
-# Output directory with parameters in name
-output_dir = f"sampled_data_{N}_{ONLY_MAIN_LABEL}"
+# Output directory with clean, readable name
+if ONLY_MAIN_LABEL:
+    label_type = "main_labels_only"
+else:
+    label_type = "filtered_labels"
+
+output_dir = f"sampled_data_{N}_{label_type}"
 os.makedirs(output_dir, exist_ok=True)
+
+print(f"Will save data to: {output_dir}")
 
 # Languages to process
 languages = ["en", "fr", "ur", "zh"]
@@ -75,10 +82,12 @@ def process_fold(fold_dir, base_dir, languages, N, ONLY_MAIN_LABEL, output_dir):
             for row in reader:
                 rows.append(row)
 
+        print(f"  Processing {lang} file with {len(rows)} rows")
+
         # Group rows by label for sampling
         label_groups = defaultdict(list)
 
-        for row in rows:
+        for row in tqdm(rows, desc=f"Filtering {lang} rows", leave=False):
             # Parse the preds_0.4 column (it's a string representation of a list)
             try:
                 preds_0_4 = ast.literal_eval(row["preds_0.4"])
@@ -161,7 +170,9 @@ process_fold_partial = partial(
 if num_workers > 1:
     print(f"Using {num_workers} worker processes for parallel processing")
     with mp.Pool(processes=num_workers) as pool:
-        results = pool.map(process_fold_partial, fold_dirs)
+        results = pool.map(
+            process_fold_partial, tqdm(fold_dirs, desc="Processing folds")
+        )
 
     # Print summary of processed folds
     print("\nProcessing summary:")
@@ -170,7 +181,7 @@ if num_workers > 1:
 else:
     print("Processing sequentially (no multiprocessing)")
     results = []
-    for fold_dir in fold_dirs:
+    for fold_dir in tqdm(fold_dirs, desc="Processing folds"):
         results.append(process_fold_partial(fold_dir))
 
 print(f"Sampling complete. Data saved to {output_dir}/")
