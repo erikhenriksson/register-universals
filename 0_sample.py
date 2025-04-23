@@ -169,10 +169,16 @@ process_fold_partial = partial(
 # Process folds in parallel if num_workers > 1, otherwise sequentially
 if num_workers > 1:
     print(f"Using {num_workers} worker processes for parallel processing")
+    # Using imap instead of map to get better progress reporting
     with mp.Pool(processes=num_workers) as pool:
-        results = pool.map(
-            process_fold_partial, tqdm(fold_dirs, desc="Processing folds")
-        )
+        results = []
+        # Use imap for better progress monitoring with tqdm
+        for result in tqdm(
+            pool.imap_unordered(process_fold_partial, fold_dirs),
+            total=len(fold_dirs),
+            desc="Processing folds",
+        ):
+            results.append(result)
 
     # Print summary of processed folds
     print("\nProcessing summary:")
