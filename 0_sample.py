@@ -9,6 +9,10 @@ from tqdm import tqdm
 import argparse
 import multiprocessing as mp
 from functools import partial
+import sys
+
+# Increase CSV field size limit to maximum integer size
+csv.field_size_limit(2147483647)  # Use a large but safe integer value
 
 # Parse command line arguments
 parser = argparse.ArgumentParser(description="Sample data from TSV files.")
