@@ -68,6 +68,9 @@ def process_fold(fold_dir, base_dir, languages, N, ONLY_MAIN_LABEL, output_dir):
     # Initialize data structure for this fold
     fold_data = []
 
+    # Dictionary to track statistics
+    fold_stats = {lang: {} for lang in languages}
+
     # Process each language file
     for lang in languages:
         tsv_file = os.path.join(fold_path, f"{lang}_embeds.tsv")
@@ -99,14 +102,18 @@ def process_fold(fold_dir, base_dir, languages, N, ONLY_MAIN_LABEL, output_dir):
 
             # Apply filtering based on ONLY_MAIN_LABEL
             if ONLY_MAIN_LABEL:
-                # Only keep examples with a single uppercase (main) label
+                # Only keep examples with a single uppercase (main) label, excluding "MT"
                 main_labels = [label for label in preds_0_4 if label.isupper()]
-                if len(main_labels) == 1:
+                if len(main_labels) == 1 and main_labels[0] != "MT":
                     label = main_labels[0]
                     label_groups[label].append(row)
             else:
-                # Remove lowercase labels and check if there's only one left
-                filtered_labels = [label for label in preds_0_4 if not label.islower()]
+                # Remove lowercase labels and "MT", then check if there's only one left
+                filtered_labels = [
+                    label
+                    for label in preds_0_4
+                    if not label.islower() and label != "MT"
+                ]
                 if len(filtered_labels) == 1:
                     label = filtered_labels[0]
                     label_groups[label].append(row)
@@ -114,6 +121,9 @@ def process_fold(fold_dir, base_dir, languages, N, ONLY_MAIN_LABEL, output_dir):
         # Sample N rows for each label (or all if less than N)
         for label, group in label_groups.items():
             sampled = random.sample(group, min(N, len(group)))
+
+            # Track statistics
+            fold_stats[lang][label] = len(sampled)
 
             for item in sampled:
                 # Parse and process the embedding columns
@@ -153,7 +163,11 @@ def process_fold(fold_dir, base_dir, languages, N, ONLY_MAIN_LABEL, output_dir):
         pickle.dump(fold_data, f)
 
     print(f"Saved {len(fold_data)} samples for {fold_dir} to {output_file}")
-    return fold_dir, len(fold_data)  # Return fold name and count for summary
+    return (
+        fold_dir,
+        len(fold_data),
+        fold_stats,
+    )  # Return fold name, count, and statistics
 
 
 # Set up the process pool and run the processing
@@ -182,12 +196,107 @@ if num_workers > 1:
 
     # Print summary of processed folds
     print("\nProcessing summary:")
-    for fold_dir, count in results:
+    for fold_dir, count, stats in results:
         print(f"  {fold_dir}: {count} samples")
+
+    # Print detailed statistics
+    print("\nDetailed statistics (samples per label per language):")
+    for fold_dir, count, stats in results:
+        fold_number = fold_dir.split("-")[-1]
+        print(f"\nFold {fold_number} statistics:")
+
+        # Find all unique labels across all languages
+        all_labels = set()
+        for lang in languages:
+            if lang in stats:
+                all_labels.update(stats[lang].keys())
+
+        # Sort labels for consistent output
+        sorted_labels = sorted(list(all_labels))
+
+        # Print header
+        print(f"{'Language':<10}", end="")
+        for label in sorted_labels:
+            print(f"{label:<10}", end="")
+        print("Total")
+
+        # Print counts for each language
+        lang_totals = {}
+        for lang in languages:
+            if lang in stats:
+                print(f"{lang:<10}", end="")
+                lang_total = 0
+                for label in sorted_labels:
+                    count = stats[lang].get(label, 0)
+                    lang_total += count
+                    print(f"{count:<10}", end="")
+                print(f"{lang_total}")
+                lang_totals[lang] = lang_total
+
+        # Print label totals
+        print(f"{'Total':<10}", end="")
+        grand_total = 0
+        for label in sorted_labels:
+            label_total = sum(
+                stats[lang].get(label, 0) for lang in languages if lang in stats
+            )
+            grand_total += label_total
+            print(f"{label_total:<10}", end="")
+        print(f"{grand_total}")
 else:
     print("Processing sequentially (no multiprocessing)")
     results = []
     for fold_dir in tqdm(fold_dirs, desc="Processing folds"):
         results.append(process_fold_partial(fold_dir))
+
+    # Print summary of processed folds
+    print("\nProcessing summary:")
+    for fold_dir, count, stats in results:
+        print(f"  {fold_dir}: {count} samples")
+
+    # Print detailed statistics
+    print("\nDetailed statistics (samples per label per language):")
+    for fold_dir, count, stats in results:
+        fold_number = fold_dir.split("-")[-1]
+        print(f"\nFold {fold_number} statistics:")
+
+        # Find all unique labels across all languages
+        all_labels = set()
+        for lang in languages:
+            if lang in stats:
+                all_labels.update(stats[lang].keys())
+
+        # Sort labels for consistent output
+        sorted_labels = sorted(list(all_labels))
+
+        # Print header
+        print(f"{'Language':<10}", end="")
+        for label in sorted_labels:
+            print(f"{label:<10}", end="")
+        print("Total")
+
+        # Print counts for each language
+        lang_totals = {}
+        for lang in languages:
+            if lang in stats:
+                print(f"{lang:<10}", end="")
+                lang_total = 0
+                for label in sorted_labels:
+                    count = stats[lang].get(label, 0)
+                    lang_total += count
+                    print(f"{count:<10}", end="")
+                print(f"{lang_total}")
+                lang_totals[lang] = lang_total
+
+        # Print label totals
+        print(f"{'Total':<10}", end="")
+        grand_total = 0
+        for label in sorted_labels:
+            label_total = sum(
+                stats[lang].get(label, 0) for lang in languages if lang in stats
+            )
+            grand_total += label_total
+            print(f"{label_total:<10}", end="")
+        print(f"{grand_total}")
 
 print(f"Sampling complete. Data saved to {output_dir}/")
