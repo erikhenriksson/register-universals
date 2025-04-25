@@ -73,7 +73,15 @@ if ONLY_MAIN_LABEL:
 else:
     input_dir = f"sampled_data_{N}_filtered_labels"
 
+# Create output directory
+output_dir = (
+    f"clustering_results_{N}_{'main_labels' if ONLY_MAIN_LABEL else 'filtered_labels'}"
+)
+os.makedirs(output_dir, exist_ok=True)
+
 print(f"Reading data from: {input_dir}")
+print(f"Results will be saved to: {output_dir}")
+
 if not os.path.exists(input_dir):
     print(
         f"Error: Directory {input_dir} does not exist. Please run the sampling script first."
