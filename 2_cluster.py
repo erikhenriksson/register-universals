@@ -37,6 +37,20 @@ parser.add_argument(
     default=None,
     help="Number of parallel jobs to run. Default: 90% of available CPUs.",
 )
+parser.add_argument(
+    "--skip_pca", action="store_true", help="Skip PCA and only use UMAP and raw data."
+)
+parser.add_argument(
+    "--use_saved_results",
+    action="store_true",
+    help="Use previously saved intermediate results if available.",
+)
+parser.add_argument(
+    "--resume_from",
+    type=str,
+    default=None,
+    help="Resume from a specific fold file, skipping earlier folds.",
+)
 args = parser.parse_args()
 
 N = args.N
@@ -72,14 +86,34 @@ fold_files = [
 ]
 fold_files.sort()
 
-print(f"Found {len(fold_files)} fold files.")
+# If resuming from a specific fold, filter the fold files
+if args.resume_from:
+    if args.resume_from in fold_files:
+        resume_index = fold_files.index(args.resume_from)
+        skipped_folds = fold_files[:resume_index]
+        fold_files = fold_files[resume_index:]
+        print(
+            f"Resuming from {args.resume_from}. Skipping {len(skipped_folds)} earlier folds."
+        )
+    else:
+        print(
+            f"Warning: Specified resume fold {args.resume_from} not found. Processing all folds."
+        )
+
+print(f"Found {len(fold_files)} fold files to process.")
 
 # Define the dimensionality reduction techniques and dimensions
-reductions = {
-    "raw": None,  # No reduction, use raw embeddings
-    "pca": {"name": "PCA", "dims": [2, 4, 8, 16, 32]},
-    "umap": {"name": "UMAP", "dims": [2, 4, 8, 16, 32]},
-}
+reductions = {}
+
+# Always include raw data
+reductions["raw"] = None
+
+# Add UMAP
+reductions["umap"] = {"name": "UMAP", "dims": [2, 4, 8, 16, 32]}
+
+# Add PCA if not skipped
+if not args.skip_pca:
+    reductions["pca"] = {"name": "PCA", "dims": [2, 4, 8, 16, 32]}
 
 # Define embedding types to analyze
 embedding_types = ["embed_first", "embed_half", "embed_last"]
@@ -217,15 +251,34 @@ for fold_file in tqdm(fold_files, desc="Processing folds"):
 
     print(f"  Created {len(clustering_tasks)} clustering tasks")
 
-    # Process clustering tasks in parallel
-    with mp.Pool(processes=n_jobs) as pool:
-        results = list(
-            tqdm(
-                pool.imap(process_clustering_task, clustering_tasks),
-                total=len(clustering_tasks),
-                desc="Running clustering",
+    # Save intermediate data to allow restart
+    intermediate_file = os.path.join(output_dir, f"intermediate_tasks_{fold_file}")
+    with open(intermediate_file, "wb") as f:
+        pickle.dump({"tasks": clustering_tasks, "data_map": data_map}, f)
+
+    print(f"  Saved intermediate tasks to {intermediate_file}")
+
+    # Check if we should use saved results
+    results_file = os.path.join(output_dir, f"results_{fold_file}")
+    if os.path.exists(results_file) and args.use_saved_results:
+        print(f"  Loading previously computed results from {results_file}")
+        with open(results_file, "rb") as f:
+            results = pickle.load(f)
+    else:
+        # Process clustering tasks in parallel
+        with mp.Pool(processes=n_jobs) as pool:
+            results = list(
+                tqdm(
+                    pool.imap(process_clustering_task, clustering_tasks),
+                    total=len(clustering_tasks),
+                    desc="Running clustering",
+                )
             )
-        )
+
+        # Save results
+        with open(results_file, "wb") as f:
+            pickle.dump(results, f)
+        print(f"  Saved clustering results to {results_file}")
 
     # Process results
     for (
