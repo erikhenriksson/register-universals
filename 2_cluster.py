@@ -10,6 +10,9 @@ from sklearn.metrics import silhouette_score, davies_bouldin_score
 from sklearn.decomposition import PCA
 import umap
 from scipy import stats
+import multiprocessing as mp
+from functools import partial
+import itertools
 
 # Parse command line arguments
 parser = argparse.ArgumentParser(description="Analyze sampled data with clustering.")
@@ -28,12 +31,27 @@ parser.add_argument(
     default=34,
     help="Maximum number of clusters to try (default: 4 languages × 8 labels + 2 = 34).",
 )
+parser.add_argument(
+    "--n_jobs",
+    type=int,
+    default=None,
+    help="Number of parallel jobs to run. Default: 90% of available CPUs.",
+)
 args = parser.parse_args()
 
 N = args.N
 ONLY_MAIN_LABEL = args.ONLY_MAIN_LABEL
 min_clusters = args.min_clusters
 max_clusters = args.max_clusters
+
+# Automatically determine number of worker processes (90% of available CPUs) if not specified
+if args.n_jobs is None:
+    available_cpus = mp.cpu_count()
+    n_jobs = max(1, int(available_cpus * 0.9))
+else:
+    n_jobs = args.n_jobs
+
+print(f"Using {n_jobs} worker processes for parallel processing")
 
 # Determine input directory based on parameters
 if ONLY_MAIN_LABEL:
@@ -66,6 +84,41 @@ reductions = {
 # Define embedding types to analyze
 embedding_types = ["embed_first", "embed_half", "embed_last"]
 
+
+# Function to process a single clustering task
+def process_clustering_task(task):
+    lang, embed_type, reduction_name, reduced_data, n_clusters = task
+
+    try:
+        # Perform clustering
+        kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
+        cluster_labels = kmeans.fit_predict(reduced_data)
+
+        # Calculate metrics if there are at least 2 clusters with data
+        if len(np.unique(cluster_labels)) >= 2:
+            sil_score = silhouette_score(reduced_data, cluster_labels)
+            db_score = davies_bouldin_score(reduced_data, cluster_labels)
+            return (
+                lang,
+                embed_type,
+                reduction_name,
+                n_clusters,
+                True,
+                sil_score,
+                db_score,
+            )
+        else:
+            print(
+                f"    Warning: Only {len(np.unique(cluster_labels))} clusters found for {lang}, {embed_type}, {reduction_name}, {n_clusters} clusters"
+            )
+            return (lang, embed_type, reduction_name, n_clusters, False, None, None)
+    except Exception as e:
+        print(
+            f"    Error processing {lang}, {embed_type}, {reduction_name}, {n_clusters} clusters: {str(e)}"
+        )
+        return (lang, embed_type, reduction_name, n_clusters, False, None, None)
+
+
 # Storage for results
 silhouette_results = defaultdict(lambda: defaultdict(lambda: defaultdict(list)))
 davies_bouldin_results = defaultdict(lambda: defaultdict(lambda: defaultdict(list)))
@@ -84,6 +137,12 @@ for fold_file in tqdm(fold_files, desc="Processing folds"):
     lang_data = defaultdict(list)
     for item in fold_data:
         lang_data[item["lang"]].append(item)
+
+    # Prepare clustering tasks
+    clustering_tasks = []
+    data_map = (
+        {}
+    )  # Store reduced data for each lang, embed_type, reduction_name combination
 
     # Process each language separately
     for lang, items in lang_data.items():
@@ -106,7 +165,17 @@ for fold_file in tqdm(fold_files, desc="Processing folds"):
                 if reduction_key == "raw":
                     # Use raw embeddings
                     reduced_data = embeddings
-                    reduction_dims = [embeddings.shape[1]]  # Original dimensionality
+                    reduction_name = "raw"
+
+                    # Store reduced data
+                    data_key = (lang, embed_type, reduction_name)
+                    data_map[data_key] = reduced_data
+
+                    # Add tasks for each cluster number
+                    for n_clusters in range(min_clusters, max_clusters + 1):
+                        clustering_tasks.append(
+                            (lang, embed_type, reduction_name, reduced_data, n_clusters)
+                        )
                 else:
                     reduction_dims = reduction_config["dims"]
 
@@ -128,39 +197,63 @@ for fold_file in tqdm(fold_files, desc="Processing folds"):
                             )
                             reduced_data = reducer.fit_transform(embeddings)
 
-                        reduction_name = (
-                            f"{reduction_key}_{n_dims}"
-                            if reduction_key != "raw"
-                            else "raw"
-                        )
+                        reduction_name = f"{reduction_key}_{n_dims}"
 
-                        # Evaluate clustering for different numbers of clusters
+                        # Store reduced data
+                        data_key = (lang, embed_type, reduction_name)
+                        data_map[data_key] = reduced_data
+
+                        # Add tasks for each cluster number
                         for n_clusters in range(min_clusters, max_clusters + 1):
-                            kmeans = KMeans(
-                                n_clusters=n_clusters, random_state=42, n_init=10
+                            clustering_tasks.append(
+                                (
+                                    lang,
+                                    embed_type,
+                                    reduction_name,
+                                    reduced_data,
+                                    n_clusters,
+                                )
                             )
-                            cluster_labels = kmeans.fit_predict(reduced_data)
 
-                            # Calculate metrics if there are at least 2 clusters with data
-                            if len(np.unique(cluster_labels)) >= 2:
-                                sil_score = silhouette_score(
-                                    reduced_data, cluster_labels
-                                )
-                                db_score = davies_bouldin_score(
-                                    reduced_data, cluster_labels
-                                )
+    print(f"  Created {len(clustering_tasks)} clustering tasks")
 
-                                # Store results
-                                silhouette_results[lang][embed_type][
-                                    reduction_name
-                                ].append(sil_score)
-                                davies_bouldin_results[lang][embed_type][
-                                    reduction_name
-                                ].append(db_score)
-                            else:
-                                print(
-                                    f"    Warning: Only {len(np.unique(cluster_labels))} clusters found for {lang}, {embed_type}, {reduction_name}, {n_clusters} clusters"
-                                )
+    # Process clustering tasks in parallel
+    with mp.Pool(processes=n_jobs) as pool:
+        results = list(
+            tqdm(
+                pool.imap(process_clustering_task, clustering_tasks),
+                total=len(clustering_tasks),
+                desc="Running clustering",
+            )
+        )
+
+    # Process results
+    for (
+        lang,
+        embed_type,
+        reduction_name,
+        n_clusters,
+        success,
+        sil_score,
+        db_score,
+    ) in results:
+        if success:
+            # Adjust index since lists are 0-indexed but clusters start at min_clusters
+            idx = n_clusters - min_clusters
+
+            # Extend lists if needed
+            curr_len = len(silhouette_results[lang][embed_type][reduction_name])
+            if curr_len <= idx:
+                silhouette_results[lang][embed_type][reduction_name].extend(
+                    [None] * (idx + 1 - curr_len)
+                )
+                davies_bouldin_results[lang][embed_type][reduction_name].extend(
+                    [None] * (idx + 1 - curr_len)
+                )
+
+            # Store scores
+            silhouette_results[lang][embed_type][reduction_name][idx] = sil_score
+            davies_bouldin_results[lang][embed_type][reduction_name][idx] = db_score
 
 
 # Calculate statistics across folds
