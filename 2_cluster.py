@@ -2,20 +2,20 @@ import os
 import pickle
 import argparse
 import numpy as np
-import matplotlib.pyplot as plt
 from tqdm import tqdm
 from collections import defaultdict
 from sklearn.cluster import KMeans
 from sklearn.metrics import silhouette_score, davies_bouldin_score
-from sklearn.decomposition import PCA
 import umap
 from scipy import stats
 import multiprocessing as mp
-from functools import partial
-import itertools
+import gc
+import time
 
 # Parse command line arguments
-parser = argparse.ArgumentParser(description="Analyze sampled data with clustering.")
+parser = argparse.ArgumentParser(
+    description="Analyze sampled data with clustering (memory-efficient version)."
+)
 parser.add_argument(
     "--N", type=int, default=1000, help="Number of samples that was used."
 )
@@ -35,10 +35,20 @@ parser.add_argument(
     "--n_jobs",
     type=int,
     default=None,
-    help="Number of parallel jobs to run. Default: 90% of available CPUs.",
+    help="Number of parallel jobs to run. Default: 50% of available CPUs.",
 )
 parser.add_argument(
-    "--skip_pca", action="store_true", help="Skip PCA and only use UMAP and raw data."
+    "--batch_size",
+    type=int,
+    default=50,
+    help="Number of clustering tasks to process in one batch to manage memory usage.",
+)
+parser.add_argument(
+    "--embedding_type",
+    type=str,
+    default=None,
+    choices=["embed_first", "embed_half", "embed_last"],
+    help="Process only a specific embedding type. If not specified, processes all types one by one.",
 )
 parser.add_argument(
     "--use_saved_results",
@@ -58,10 +68,10 @@ ONLY_MAIN_LABEL = args.ONLY_MAIN_LABEL
 min_clusters = args.min_clusters
 max_clusters = args.max_clusters
 
-# Automatically determine number of worker processes (90% of available CPUs) if not specified
+# Use fewer CPUs by default to leave more memory per process
 if args.n_jobs is None:
     available_cpus = mp.cpu_count()
-    n_jobs = max(1, int(available_cpus * 0.9))
+    n_jobs = max(1, int(available_cpus * 0.5))  # Use 50% of CPUs by default
 else:
     n_jobs = args.n_jobs
 
@@ -110,26 +120,28 @@ if args.resume_from:
 
 print(f"Found {len(fold_files)} fold files to process.")
 
-# Define the dimensionality reduction techniques and dimensions
-reductions = {}
-
-# Always include raw data
-reductions["raw"] = None
-
-# Add UMAP
-reductions["umap"] = {"name": "UMAP", "dims": [2, 4, 8, 16, 32]}
-
-# Add PCA if not skipped
-if not args.skip_pca:
-    reductions["pca"] = {"name": "PCA", "dims": [2, 4, 8, 16, 32]}
-
 # Define embedding types to analyze
-embedding_types = ["embed_first", "embed_half", "embed_last"]
+if args.embedding_type:
+    embedding_types = [args.embedding_type]
+    print(f"Processing only embedding type: {args.embedding_type}")
+else:
+    embedding_types = ["embed_first", "embed_half", "embed_last"]
+    print(f"Processing all embedding types sequentially: {embedding_types}")
+
+# Define the dimensionality reduction techniques and dimensions
+reductions = {
+    "raw": None,  # No reduction, use raw embeddings
+    "umap": {"name": "UMAP", "dims": [2, 4, 8, 16, 32]},
+}
+
+# Storage for results
+silhouette_results = defaultdict(lambda: defaultdict(lambda: defaultdict(list)))
+davies_bouldin_results = defaultdict(lambda: defaultdict(lambda: defaultdict(list)))
 
 
 # Function to process a single clustering task
-def process_clustering_task(task):
-    lang, embed_type, reduction_name, reduced_data, n_clusters = task
+def process_clustering_task(task_data):
+    lang, embed_type, reduction_name, n_clusters, reduced_data = task_data
 
     try:
         # Perform clustering
@@ -161,63 +173,108 @@ def process_clustering_task(task):
         return (lang, embed_type, reduction_name, n_clusters, False, None, None)
 
 
-# Storage for results
-silhouette_results = defaultdict(lambda: defaultdict(lambda: defaultdict(list)))
-davies_bouldin_results = defaultdict(lambda: defaultdict(lambda: defaultdict(list)))
-
 # Process each fold
 for fold_file in tqdm(fold_files, desc="Processing folds"):
     fold_path = os.path.join(input_dir, fold_file)
+    fold_results_file = os.path.join(output_dir, f"fold_results_{fold_file}")
+
+    # Skip if results already exist and we're using saved results
+    if os.path.exists(fold_results_file) and args.use_saved_results:
+        print(f"Loading existing results for {fold_file}")
+        with open(fold_results_file, "rb") as f:
+            fold_results = pickle.load(f)
+
+        # Update the global results
+        for lang, embed_results in fold_results["silhouette"].items():
+            for embed_type, reduction_results in embed_results.items():
+                for reduction_name, scores in reduction_results.items():
+                    silhouette_results[lang][embed_type][reduction_name] = scores
+
+        for lang, embed_results in fold_results["davies_bouldin"].items():
+            for embed_type, reduction_results in embed_results.items():
+                for reduction_name, scores in reduction_results.items():
+                    davies_bouldin_results[lang][embed_type][reduction_name] = scores
+
+        continue
 
     # Load the fold data
+    print(f"\nProcessing {fold_file}")
     with open(fold_path, "rb") as f:
         fold_data = pickle.load(f)
 
-    print(f"\nProcessing {fold_file} with {len(fold_data)} samples")
+    print(f"Loaded {fold_file} with {len(fold_data)} samples")
 
-    # Group data by language to process separately
+    # Group data by language
     lang_data = defaultdict(list)
     for item in fold_data:
         lang_data[item["lang"]].append(item)
 
-    # Prepare clustering tasks
-    clustering_tasks = []
-    data_map = (
-        {}
-    )  # Store reduced data for each lang, embed_type, reduction_name combination
+    # Clear fold_data to free memory
+    del fold_data
+    gc.collect()
 
-    # Process each language separately
-    for lang, items in lang_data.items():
-        print(f"  Processing language: {lang} with {len(items)} samples")
+    # Initialize fold-specific results
+    fold_silhouette = defaultdict(lambda: defaultdict(dict))
+    fold_davies_bouldin = defaultdict(lambda: defaultdict(dict))
 
-        # Skip if too few samples
-        if len(items) < max_clusters:
-            print(
-                f"    Skipping {lang}: Not enough samples ({len(items)}) for clustering"
-            )
-            continue
+    # Process each embedding type separately to save memory
+    for embed_type in embedding_types:
+        print(f"\n  Processing embedding type: {embed_type}")
 
-        # Process each embedding type
-        for embed_type in embedding_types:
-            # Extract embeddings
+        # Process each language separately
+        for lang, items in lang_data.items():
+            print(f"    Processing language: {lang} with {len(items)} samples")
+
+            # Skip if too few samples
+            if len(items) < max_clusters:
+                print(
+                    f"      Skipping {lang}: Not enough samples ({len(items)}) for clustering"
+                )
+                continue
+
+            # Extract only the needed embeddings to save memory
             embeddings = np.array([item[embed_type] for item in items])
 
-            # Process with each reduction technique
+            # Prepare for each reduction technique
             for reduction_key, reduction_config in reductions.items():
                 if reduction_key == "raw":
                     # Use raw embeddings
                     reduced_data = embeddings
                     reduction_name = "raw"
 
-                    # Store reduced data
-                    data_key = (lang, embed_type, reduction_name)
-                    data_map[data_key] = reduced_data
-
-                    # Add tasks for each cluster number
+                    # Prepare clustering tasks
+                    tasks = []
                     for n_clusters in range(min_clusters, max_clusters + 1):
-                        clustering_tasks.append(
-                            (lang, embed_type, reduction_name, reduced_data, n_clusters)
+                        task = (
+                            lang,
+                            embed_type,
+                            reduction_name,
+                            n_clusters,
+                            reduced_data,
                         )
+                        tasks.append(task)
+
+                    # Process in batches
+                    print(
+                        f"      Processing {len(tasks)} raw data clustering tasks in batches"
+                    )
+                    results = []
+
+                    for i in range(0, len(tasks), args.batch_size):
+                        batch = tasks[i : i + args.batch_size]
+                        with mp.Pool(processes=n_jobs) as pool:
+                            batch_results = list(
+                                tqdm(
+                                    pool.imap(process_clustering_task, batch),
+                                    total=len(batch),
+                                    desc=f"      Batch {i//args.batch_size + 1}/{(len(tasks) + args.batch_size - 1)//args.batch_size}",
+                                )
+                            )
+                            results.extend(batch_results)
+
+                        # Force garbage collection between batches
+                        gc.collect()
+                        time.sleep(1)  # Small delay to ensure memory is freed
                 else:
                     reduction_dims = reduction_config["dims"]
 
@@ -227,10 +284,10 @@ for fold_file in tqdm(fold_files, desc="Processing folds"):
                             continue
 
                         # Apply dimensionality reduction
-                        if reduction_key == "pca":
-                            reducer = PCA(n_components=n_dims, random_state=42)
-                            reduced_data = reducer.fit_transform(embeddings)
-                        elif reduction_key == "umap":
+                        if reduction_key == "umap":
+                            print(
+                                f"      Applying UMAP reduction to {n_dims} dimensions"
+                            )
                             reducer = umap.UMAP(
                                 n_components=n_dims,
                                 random_state=42,
@@ -241,80 +298,85 @@ for fold_file in tqdm(fold_files, desc="Processing folds"):
 
                         reduction_name = f"{reduction_key}_{n_dims}"
 
-                        # Store reduced data
-                        data_key = (lang, embed_type, reduction_name)
-                        data_map[data_key] = reduced_data
-
-                        # Add tasks for each cluster number
+                        # Prepare clustering tasks
+                        tasks = []
                         for n_clusters in range(min_clusters, max_clusters + 1):
-                            clustering_tasks.append(
-                                (
-                                    lang,
-                                    embed_type,
-                                    reduction_name,
-                                    reduced_data,
-                                    n_clusters,
+                            task = (
+                                lang,
+                                embed_type,
+                                reduction_name,
+                                n_clusters,
+                                reduced_data,
+                            )
+                            tasks.append(task)
+
+                        # Process in batches
+                        print(
+                            f"      Processing {len(tasks)} {reduction_name} clustering tasks in batches"
+                        )
+                        results = []
+
+                        for i in range(0, len(tasks), args.batch_size):
+                            batch = tasks[i : i + args.batch_size]
+                            with mp.Pool(processes=n_jobs) as pool:
+                                batch_results = list(
+                                    tqdm(
+                                        pool.imap(process_clustering_task, batch),
+                                        total=len(batch),
+                                        desc=f"      Batch {i//args.batch_size + 1}/{(len(tasks) + args.batch_size - 1)//args.batch_size}",
+                                    )
                                 )
+                                results.extend(batch_results)
+
+                            # Force garbage collection between batches
+                            gc.collect()
+                            time.sleep(1)  # Small delay to ensure memory is freed
+
+                # Process results for this reduction method
+                for (
+                    lang,
+                    et,
+                    red_name,
+                    n_clusters,
+                    success,
+                    sil_score,
+                    db_score,
+                ) in results:
+                    if success:
+                        # Initialize if needed
+                        if red_name not in fold_silhouette[lang][et]:
+                            fold_silhouette[lang][et][red_name] = [None] * (
+                                max_clusters - min_clusters + 1
+                            )
+                            fold_davies_bouldin[lang][et][red_name] = [None] * (
+                                max_clusters - min_clusters + 1
                             )
 
-    print(f"  Created {len(clustering_tasks)} clustering tasks")
+                        # Store scores at the correct index
+                        idx = n_clusters - min_clusters
+                        fold_silhouette[lang][et][red_name][idx] = sil_score
+                        fold_davies_bouldin[lang][et][red_name][idx] = db_score
 
-    # Save intermediate data to allow restart
-    intermediate_file = os.path.join(output_dir, f"intermediate_tasks_{fold_file}")
-    with open(intermediate_file, "wb") as f:
-        pickle.dump({"tasks": clustering_tasks, "data_map": data_map}, f)
+    # Save fold results
+    fold_results = {
+        "silhouette": fold_silhouette,
+        "davies_bouldin": fold_davies_bouldin,
+    }
 
-    print(f"  Saved intermediate tasks to {intermediate_file}")
+    with open(fold_results_file, "wb") as f:
+        pickle.dump(fold_results, f)
+    print(f"Saved results for {fold_file} to {fold_results_file}")
 
-    # Check if we should use saved results
-    results_file = os.path.join(output_dir, f"results_{fold_file}")
-    if os.path.exists(results_file) and args.use_saved_results:
-        print(f"  Loading previously computed results from {results_file}")
-        with open(results_file, "rb") as f:
-            results = pickle.load(f)
-    else:
-        # Process clustering tasks in parallel
-        with mp.Pool(processes=n_jobs) as pool:
-            results = list(
-                tqdm(
-                    pool.imap(process_clustering_task, clustering_tasks),
-                    total=len(clustering_tasks),
-                    desc="Running clustering",
-                )
-            )
+    # Update the global results
+    for lang, embed_results in fold_silhouette.items():
+        for embed_type, reduction_results in embed_results.items():
+            for reduction_name, scores in reduction_results.items():
+                silhouette_results[lang][embed_type][reduction_name].append(scores)
 
-        # Save results
-        with open(results_file, "wb") as f:
-            pickle.dump(results, f)
-        print(f"  Saved clustering results to {results_file}")
-
-    # Process results
-    for (
-        lang,
-        embed_type,
-        reduction_name,
-        n_clusters,
-        success,
-        sil_score,
-        db_score,
-    ) in results:
-        if success:
-            # Adjust index since lists are 0-indexed but clusters start at min_clusters
-            idx = n_clusters - min_clusters
-
-            # Extend lists if needed
-            curr_len = len(silhouette_results[lang][embed_type][reduction_name])
-            if curr_len <= idx:
-                silhouette_results[lang][embed_type][reduction_name].extend(
-                    [None] * (idx + 1 - curr_len)
-                )
-                davies_bouldin_results[lang][embed_type][reduction_name].extend(
-                    [None] * (idx + 1 - curr_len)
-                )
-
-            # Store scores
-            silhouette_results[lang][embed_type][reduction_name][idx] = sil_score
-            davies_bouldin_results[lang][embed_type][reduction_name][idx] = db_score
+    for lang, embed_results in fold_davies_bouldin.items():
+        for embed_type, reduction_results in embed_results.items():
+            for reduction_name, scores in reduction_results.items():
+                davies_bouldin_results[lang][embed_type][reduction_name].append(scores)
 
 
 # Calculate statistics across folds
@@ -325,12 +387,26 @@ def calculate_stats(results):
         for embed_type in results[lang]:
             stats[lang][embed_type] = {}
             for reduction_name in results[lang][embed_type]:
-                # Convert to numpy array for easy stats calculation
-                scores = np.array(results[lang][embed_type][reduction_name])
+                # Filter out None values for each cluster count
+                processed_scores = []
+                for fold_scores in results[lang][embed_type][reduction_name]:
+                    if fold_scores is not None:
+                        processed_scores.append(
+                            [
+                                score if score is not None else np.nan
+                                for score in fold_scores
+                            ]
+                        )
 
-                # Calculate mean and standard error
-                mean = np.mean(scores, axis=0)
-                stderr = stats.sem(scores, axis=0)
+                if not processed_scores:
+                    continue
+
+                # Convert to numpy array for easy stats calculation
+                scores_array = np.array(processed_scores)
+
+                # Calculate mean and standard error, ignoring NaNs
+                mean = np.nanmean(scores_array, axis=0)
+                stderr = stats.sem(scores_array, axis=0, nan_policy="omit")
 
                 stats[lang][embed_type][reduction_name] = {
                     "mean": mean,
@@ -342,102 +418,26 @@ def calculate_stats(results):
 silhouette_stats = calculate_stats(silhouette_results)
 davies_bouldin_stats = calculate_stats(davies_bouldin_results)
 
+# Save final results
+results_data = {
+    "silhouette_results": silhouette_results,
+    "davies_bouldin_results": davies_bouldin_results,
+    "silhouette_stats": silhouette_stats,
+    "davies_bouldin_stats": davies_bouldin_stats,
+    "parameters": {
+        "N": N,
+        "ONLY_MAIN_LABEL": ONLY_MAIN_LABEL,
+        "min_clusters": min_clusters,
+        "max_clusters": max_clusters,
+        "embedding_types": embedding_types,
+        "languages": list(silhouette_results.keys()),
+    },
+}
 
-# Plot results
-def plot_metric(stats, metric_name, output_prefix):
-    # Get all languages and embedding types
-    all_languages = list(stats.keys())
-
-    for embed_type in embedding_types:
-        plt.figure(figsize=(15, 8))
-
-        # Different line styles for different reduction methods
-        line_styles = {"raw": "-", "pca": "--", "umap": "-."}
-
-        # Different colors for different dimensions
-        color_map = plt.cm.get_cmap("viridis", 6)
-
-        for lang_idx, lang in enumerate(all_languages):
-            if embed_type not in stats[lang]:
-                continue
-
-            # Plot for each reduction method and dimension
-            reduction_methods = defaultdict(list)
-
-            for reduction_name in stats[lang][embed_type]:
-                # Identify the base reduction method and dimension
-                if reduction_name == "raw":
-                    base_method = "raw"
-                    dim = "raw"
-                else:
-                    base_method, dim = reduction_name.split("_")
-
-                reduction_methods[(base_method, dim)].append(reduction_name)
-
-            for method_idx, ((base_method, dim), _) in enumerate(
-                sorted(reduction_methods.items())
-            ):
-                if base_method == "raw":
-                    reduction_label = f"{lang} - Raw"
-                    color = color_map(0)
-                else:
-                    dim_idx = reductions[base_method]["dims"].index(int(dim)) + 1
-                    reduction_label = f"{lang} - {base_method.upper()} {dim}"
-                    color = color_map(dim_idx)
-
-                # Get the actual reduction name
-                reduction_name = (
-                    f"{base_method}_{dim}" if base_method != "raw" else "raw"
-                )
-
-                # Extract data
-                mean = stats[lang][embed_type][reduction_name]["mean"]
-                stderr = stats[lang][embed_type][reduction_name]["stderr"]
-
-                # Create x-axis (number of clusters)
-                x = np.arange(min_clusters, min_clusters + len(mean))
-
-                # Plot mean and error band
-                plt.plot(
-                    x,
-                    mean,
-                    label=reduction_label,
-                    linestyle=line_styles[base_method],
-                    color=color,
-                )
-                plt.fill_between(
-                    x, mean - stderr, mean + stderr, color=color, alpha=0.2
-                )
-
-        plt.xlabel("Number of Clusters")
-        plt.ylabel(metric_name)
-        plt.title(f"{metric_name} Score by Number of Clusters for {embed_type}")
-        plt.grid(True, linestyle="--", alpha=0.7)
-        plt.legend(loc="best")
-
-        # Save plot
-        output_file = f"{output_prefix}_{embed_type}.png"
-        plt.savefig(output_file, dpi=300, bbox_inches="tight")
-        print(f"Saved plot to {output_file}")
-        plt.close()
-
-
-# Create output directory
-output_dir = (
-    f"clustering_results_{N}_{'main_labels' if ONLY_MAIN_LABEL else 'filtered_labels'}"
+results_file = os.path.join(output_dir, "clustering_results.pkl")
+with open(results_file, "wb") as f:
+    pickle.dump(results_data, f)
+print(f"Saved final results to {results_file}")
+print(
+    "\nClustering analysis complete. Use plot_clustering_results.py to visualize the results."
 )
-os.makedirs(output_dir, exist_ok=True)
-
-# Plot silhouette scores
-plot_metric(
-    silhouette_stats, "Silhouette Score", os.path.join(output_dir, "silhouette")
-)
-
-# Plot Davies-Bouldin scores
-plot_metric(
-    davies_bouldin_stats,
-    "Davies-Bouldin Score",
-    os.path.join(output_dir, "davies_bouldin"),
-)
-
-print(f"\nClustering analysis complete. Results saved to {output_dir}/")
