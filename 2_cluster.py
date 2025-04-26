@@ -1,443 +1,217 @@
 import os
 import pickle
-import argparse
 import numpy as np
-from tqdm import tqdm
-from collections import defaultdict
-from sklearn.cluster import KMeans
-from sklearn.metrics import silhouette_score, davies_bouldin_score
-import umap
-from scipy import stats
+import argparse
 import multiprocessing as mp
-import gc
+from functools import partial
+from tqdm import tqdm
+import umap
 import time
+import warnings
+
+# Suppress specific UMAP warnings
+warnings.filterwarnings("ignore", category=UserWarning, module="umap")
 
 # Parse command line arguments
 parser = argparse.ArgumentParser(
-    description="Analyze sampled data with clustering (memory-efficient version)."
+    description="Generate UMAP projections from embeddings."
 )
 parser.add_argument(
-    "--N", type=int, default=1000, help="Number of samples that was used."
-)
-parser.add_argument(
-    "--ONLY_MAIN_LABEL", action="store_true", help="Whether only main labels were used."
-)
-parser.add_argument(
-    "--min_clusters", type=int, default=2, help="Minimum number of clusters to try."
-)
-parser.add_argument(
-    "--max_clusters",
+    "--N",
     type=int,
-    default=34,
-    help="Maximum number of clusters to try (default: 4 languages × 8 labels + 2 = 34).",
+    default=1000,
+    help="Number of samples per label per language (used for directory naming).",
 )
 parser.add_argument(
-    "--n_jobs",
-    type=int,
-    default=None,
-    help="Number of parallel jobs to run. Default: 50% of available CPUs.",
-)
-parser.add_argument(
-    "--batch_size",
-    type=int,
-    default=50,
-    help="Number of clustering tasks to process in one batch to manage memory usage.",
-)
-parser.add_argument(
-    "--embedding_type",
-    type=str,
-    default=None,
-    choices=["embed_first", "embed_half", "embed_last"],
-    help="Process only a specific embedding type. If not specified, processes all types one by one.",
-)
-parser.add_argument(
-    "--use_saved_results",
+    "--ONLY_MAIN_LABEL",
     action="store_true",
-    help="Use previously saved intermediate results if available.",
+    help="If set, process data from main_labels_only directory.",
 )
 parser.add_argument(
-    "--resume_from",
+    "--random_state",
+    type=int,
+    default=42,
+    help="Random state for UMAP for reproducibility.",
+)
+parser.add_argument(
+    "--n_neighbors", type=int, default=15, help="n_neighbors parameter for UMAP."
+)
+parser.add_argument(
+    "--min_dist", type=float, default=0.1, help="min_dist parameter for UMAP."
+)
+parser.add_argument(
+    "--base_dir",
     type=str,
-    default=None,
-    help="Resume from a specific fold file, skipping earlier folds.",
+    default="./",
+    help="Base directory containing sampled data directories.",
+)
+parser.add_argument(
+    "--cpu_fraction",
+    type=float,
+    default=0.9,
+    help="Fraction of CPUs to use for parallel processing (0.0-1.0).",
 )
 args = parser.parse_args()
 
-N = args.N
-ONLY_MAIN_LABEL = args.ONLY_MAIN_LABEL
-min_clusters = args.min_clusters
-max_clusters = args.max_clusters
-
-# Use fewer CPUs by default to leave more memory per process
-if args.n_jobs is None:
-    available_cpus = mp.cpu_count()
-    n_jobs = max(1, int(available_cpus * 0.5))  # Use 50% of CPUs by default
+# Setup directory paths
+if args.ONLY_MAIN_LABEL:
+    label_type = "main_labels_only"
 else:
-    n_jobs = args.n_jobs
+    label_type = "filtered_labels"
 
-print(f"Using {n_jobs} worker processes for parallel processing")
-
-# Determine input directory based on parameters
-if ONLY_MAIN_LABEL:
-    input_dir = f"sampled_data_{N}_main_labels_only"
-else:
-    input_dir = f"sampled_data_{N}_filtered_labels"
+input_dir = os.path.join(args.base_dir, f"sampled_data_{args.N}_{label_type}")
+output_dir = os.path.join(args.base_dir, f"umap_data_{args.N}_{label_type}")
 
 # Create output directory
-output_dir = (
-    f"clustering_results_{N}_{'main_labels' if ONLY_MAIN_LABEL else 'filtered_labels'}"
-)
 os.makedirs(output_dir, exist_ok=True)
 
-print(f"Reading data from: {input_dir}")
-print(f"Results will be saved to: {output_dir}")
+# Automatically determine number of worker processes
+available_cpus = mp.cpu_count()
+num_workers = max(1, int(available_cpus * args.cpu_fraction))
+print(
+    f"Detected {available_cpus} CPUs, using {num_workers} worker processes ({args.cpu_fraction * 100:.0f}%)"
+)
 
-if not os.path.exists(input_dir):
-    print(
-        f"Error: Directory {input_dir} does not exist. Please run the sampling script first."
-    )
-    exit(1)
-
-# Get list of fold pickle files
-fold_files = [
-    f for f in os.listdir(input_dir) if f.startswith("fold_") and f.endswith(".pkl")
-]
-fold_files.sort()
-
-# If resuming from a specific fold, filter the fold files
-if args.resume_from:
-    if args.resume_from in fold_files:
-        resume_index = fold_files.index(args.resume_from)
-        skipped_folds = fold_files[:resume_index]
-        fold_files = fold_files[resume_index:]
-        print(
-            f"Resuming from {args.resume_from}. Skipping {len(skipped_folds)} earlier folds."
-        )
-    else:
-        print(
-            f"Warning: Specified resume fold {args.resume_from} not found. Processing all folds."
-        )
-
-print(f"Found {len(fold_files)} fold files to process.")
-
-# Define embedding types to analyze
-if args.embedding_type:
-    embedding_types = [args.embedding_type]
-    print(f"Processing only embedding type: {args.embedding_type}")
-else:
-    embedding_types = ["embed_first", "embed_half", "embed_last"]
-    print(f"Processing all embedding types sequentially: {embedding_types}")
-
-# Define the dimensionality reduction techniques and dimensions
-reductions = {
-    "raw": None,  # No reduction, use raw embeddings
-    "umap": {"name": "UMAP", "dims": [2, 4, 8, 16, 32]},
-}
-
-# Storage for results
-silhouette_results = defaultdict(lambda: defaultdict(lambda: defaultdict(list)))
-davies_bouldin_results = defaultdict(lambda: defaultdict(lambda: defaultdict(list)))
+# UMAP dimensions to generate
+umap_dimensions = [2, 4, 8, 16, 32]
 
 
-# Function to process a single clustering task
-def process_clustering_task(task_data):
-    lang, embed_type, reduction_name, n_clusters, reduced_data = task_data
+# Function to process a single fold file
+def process_fold(fold_file, input_dir, output_dir, umap_dimensions, umap_params):
+    start_time = time.time()
+    fold_name = os.path.basename(fold_file)
+    fold_number = fold_name.split("_")[1].split(".")[0]
 
-    try:
-        # Perform clustering
-        kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
-        cluster_labels = kmeans.fit_predict(reduced_data)
-
-        # Calculate metrics if there are at least 2 clusters with data
-        if len(np.unique(cluster_labels)) >= 2:
-            sil_score = silhouette_score(reduced_data, cluster_labels)
-            db_score = davies_bouldin_score(reduced_data, cluster_labels)
-            return (
-                lang,
-                embed_type,
-                reduction_name,
-                n_clusters,
-                True,
-                sil_score,
-                db_score,
-            )
-        else:
-            print(
-                f"    Warning: Only {len(np.unique(cluster_labels))} clusters found for {lang}, {embed_type}, {reduction_name}, {n_clusters} clusters"
-            )
-            return (lang, embed_type, reduction_name, n_clusters, False, None, None)
-    except Exception as e:
-        print(
-            f"    Error processing {lang}, {embed_type}, {reduction_name}, {n_clusters} clusters: {str(e)}"
-        )
-        return (lang, embed_type, reduction_name, n_clusters, False, None, None)
-
-
-# Process each fold
-for fold_file in tqdm(fold_files, desc="Processing folds"):
-    fold_path = os.path.join(input_dir, fold_file)
-    fold_results_file = os.path.join(output_dir, f"fold_results_{fold_file}")
-
-    # Skip if results already exist and we're using saved results
-    if os.path.exists(fold_results_file) and args.use_saved_results:
-        print(f"Loading existing results for {fold_file}")
-        with open(fold_results_file, "rb") as f:
-            fold_results = pickle.load(f)
-
-        # Update the global results
-        for lang, embed_results in fold_results["silhouette"].items():
-            for embed_type, reduction_results in embed_results.items():
-                for reduction_name, scores in reduction_results.items():
-                    silhouette_results[lang][embed_type][reduction_name] = scores
-
-        for lang, embed_results in fold_results["davies_bouldin"].items():
-            for embed_type, reduction_results in embed_results.items():
-                for reduction_name, scores in reduction_results.items():
-                    davies_bouldin_results[lang][embed_type][reduction_name] = scores
-
-        continue
+    print(f"Processing {fold_name}...")
 
     # Load the fold data
-    print(f"\nProcessing {fold_file}")
+    fold_path = os.path.join(input_dir, fold_file)
     with open(fold_path, "rb") as f:
         fold_data = pickle.load(f)
 
-    print(f"Loaded {fold_file} with {len(fold_data)} samples")
+    print(f"  Loaded {len(fold_data)} samples from {fold_name}")
 
-    # Group data by language
-    lang_data = defaultdict(list)
-    for item in fold_data:
-        lang_data[item["lang"]].append(item)
+    # Extract embeddings
+    embeds_first = np.array([item["embed_first"] for item in fold_data])
+    embeds_half = np.array([item["embed_half"] for item in fold_data])
+    embeds_last = np.array([item["embed_last"] for item in fold_data])
 
-    # Clear fold_data to free memory
-    del fold_data
-    gc.collect()
+    # Extract metadata for later use
+    metadata = [
+        {"lang": item["lang"], "text": item["text"], "preds_0.4": item["preds_0.4"]}
+        for item in fold_data
+    ]
 
-    # Initialize fold-specific results
-    fold_silhouette = defaultdict(lambda: defaultdict(dict))
-    fold_davies_bouldin = defaultdict(lambda: defaultdict(dict))
+    # Process each embedding type
+    results = {}
 
-    # Process each embedding type separately to save memory
-    for embed_type in embedding_types:
-        print(f"\n  Processing embedding type: {embed_type}")
+    # Process first token embeddings
+    print(f"  Processing first token embeddings...")
+    first_results = {"raw": embeds_first}
+    for dim in umap_dimensions:
+        print(f"    Generating {dim}D UMAP projection...")
+        umap_model = umap.UMAP(n_components=dim, **umap_params)
+        first_results[f"umap_{dim}d"] = umap_model.fit_transform(embeds_first)
+    results["first"] = first_results
 
-        # Process each language separately
-        for lang, items in lang_data.items():
-            print(f"    Processing language: {lang} with {len(items)} samples")
+    # Process middle token embeddings
+    print(f"  Processing middle token embeddings...")
+    half_results = {"raw": embeds_half}
+    for dim in umap_dimensions:
+        print(f"    Generating {dim}D UMAP projection...")
+        umap_model = umap.UMAP(n_components=dim, **umap_params)
+        half_results[f"umap_{dim}d"] = umap_model.fit_transform(embeds_half)
+    results["half"] = half_results
 
-            # Skip if too few samples
-            if len(items) < max_clusters:
-                print(
-                    f"      Skipping {lang}: Not enough samples ({len(items)}) for clustering"
-                )
-                continue
+    # Process last token embeddings
+    print(f"  Processing last token embeddings...")
+    last_results = {"raw": embeds_last}
+    for dim in umap_dimensions:
+        print(f"    Generating {dim}D UMAP projection...")
+        umap_model = umap.UMAP(n_components=dim, **umap_params)
+        last_results[f"umap_{dim}d"] = umap_model.fit_transform(embeds_last)
+    results["last"] = last_results
 
-            # Extract only the needed embeddings to save memory
-            embeddings = np.array([item[embed_type] for item in items])
+    # Create final results dictionary with metadata
+    fold_results = {"metadata": metadata, "embeddings": results}
 
-            # Prepare for each reduction technique
-            for reduction_key, reduction_config in reductions.items():
-                if reduction_key == "raw":
-                    # Use raw embeddings
-                    reduced_data = embeddings
-                    reduction_name = "raw"
+    # Save the results
+    output_file = os.path.join(output_dir, f"umap_fold_{fold_number}.pkl")
+    with open(output_file, "wb") as f:
+        pickle.dump(fold_results, f)
 
-                    # Prepare clustering tasks
-                    tasks = []
-                    for n_clusters in range(min_clusters, max_clusters + 1):
-                        task = (
-                            lang,
-                            embed_type,
-                            reduction_name,
-                            n_clusters,
-                            reduced_data,
-                        )
-                        tasks.append(task)
+    elapsed_time = time.time() - start_time
+    print(
+        f"  Completed {fold_name} in {elapsed_time:.2f} seconds. Saved to {output_file}"
+    )
 
-                    # Process in batches
-                    print(
-                        f"      Processing {len(tasks)} raw data clustering tasks in batches"
-                    )
-                    results = []
+    return fold_number, len(fold_data)
 
-                    for i in range(0, len(tasks), args.batch_size):
-                        batch = tasks[i : i + args.batch_size]
-                        with mp.Pool(processes=n_jobs) as pool:
-                            batch_results = list(
-                                tqdm(
-                                    pool.imap(process_clustering_task, batch),
-                                    total=len(batch),
-                                    desc=f"      Batch {i//args.batch_size + 1}/{(len(tasks) + args.batch_size - 1)//args.batch_size}",
-                                )
-                            )
-                            results.extend(batch_results)
 
-                        # Force garbage collection between batches
-                        gc.collect()
-                        time.sleep(1)  # Small delay to ensure memory is freed
-                else:
-                    reduction_dims = reduction_config["dims"]
+# Main execution
+def main():
+    print(f"Starting UMAP projections generation...")
+    print(f"Input directory: {input_dir}")
+    print(f"Output directory: {output_dir}")
 
-                    for n_dims in reduction_dims:
-                        if n_dims >= embeddings.shape[1]:
-                            # Skip if requested dimensionality is higher than original
-                            continue
+    # Check if input directory exists
+    if not os.path.exists(input_dir):
+        print(f"Error: Input directory {input_dir} does not exist.")
+        return
 
-                        # Apply dimensionality reduction
-                        if reduction_key == "umap":
-                            print(
-                                f"      Applying UMAP reduction to {n_dims} dimensions"
-                            )
-                            reducer = umap.UMAP(
-                                n_components=n_dims,
-                                random_state=42,
-                                n_neighbors=15,
-                                min_dist=0.1,
-                            )
-                            reduced_data = reducer.fit_transform(embeddings)
+    # List fold files
+    fold_files = [
+        f for f in os.listdir(input_dir) if f.startswith("fold_") and f.endswith(".pkl")
+    ]
+    fold_files.sort()  # Sort to process in order
 
-                        reduction_name = f"{reduction_key}_{n_dims}"
+    if not fold_files:
+        print(f"Error: No fold files found in {input_dir}")
+        return
 
-                        # Prepare clustering tasks
-                        tasks = []
-                        for n_clusters in range(min_clusters, max_clusters + 1):
-                            task = (
-                                lang,
-                                embed_type,
-                                reduction_name,
-                                n_clusters,
-                                reduced_data,
-                            )
-                            tasks.append(task)
+    print(f"Found {len(fold_files)} fold files to process")
 
-                        # Process in batches
-                        print(
-                            f"      Processing {len(tasks)} {reduction_name} clustering tasks in batches"
-                        )
-                        results = []
-
-                        for i in range(0, len(tasks), args.batch_size):
-                            batch = tasks[i : i + args.batch_size]
-                            with mp.Pool(processes=n_jobs) as pool:
-                                batch_results = list(
-                                    tqdm(
-                                        pool.imap(process_clustering_task, batch),
-                                        total=len(batch),
-                                        desc=f"      Batch {i//args.batch_size + 1}/{(len(tasks) + args.batch_size - 1)//args.batch_size}",
-                                    )
-                                )
-                                results.extend(batch_results)
-
-                            # Force garbage collection between batches
-                            gc.collect()
-                            time.sleep(1)  # Small delay to ensure memory is freed
-
-                # Process results for this reduction method
-                for (
-                    lang,
-                    et,
-                    red_name,
-                    n_clusters,
-                    success,
-                    sil_score,
-                    db_score,
-                ) in results:
-                    if success:
-                        # Initialize if needed
-                        if red_name not in fold_silhouette[lang][et]:
-                            fold_silhouette[lang][et][red_name] = [None] * (
-                                max_clusters - min_clusters + 1
-                            )
-                            fold_davies_bouldin[lang][et][red_name] = [None] * (
-                                max_clusters - min_clusters + 1
-                            )
-
-                        # Store scores at the correct index
-                        idx = n_clusters - min_clusters
-                        fold_silhouette[lang][et][red_name][idx] = sil_score
-                        fold_davies_bouldin[lang][et][red_name][idx] = db_score
-
-    # Save fold results
-    fold_results = {
-        "silhouette": fold_silhouette,
-        "davies_bouldin": fold_davies_bouldin,
+    # UMAP parameters
+    umap_params = {
+        "n_neighbors": args.n_neighbors,
+        "min_dist": args.min_dist,
+        "random_state": args.random_state,
+        "metric": "cosine",  # Using cosine distance which is common for embeddings
     }
 
-    with open(fold_results_file, "wb") as f:
-        pickle.dump(fold_results, f)
-    print(f"Saved results for {fold_file} to {fold_results_file}")
+    # Set up the process pool and run the processing
+    process_fold_partial = partial(
+        process_fold,
+        input_dir=input_dir,
+        output_dir=output_dir,
+        umap_dimensions=umap_dimensions,
+        umap_params=umap_params,
+    )
 
-    # Update the global results
-    for lang, embed_results in fold_silhouette.items():
-        for embed_type, reduction_results in embed_results.items():
-            for reduction_name, scores in reduction_results.items():
-                silhouette_results[lang][embed_type][reduction_name].append(scores)
+    # Process folds in parallel if num_workers > 1, otherwise sequentially
+    if num_workers > 1:
+        print(f"Using {num_workers} worker processes for parallel processing")
+        with mp.Pool(processes=num_workers) as pool:
+            results = []
+            for result in tqdm(
+                pool.imap_unordered(process_fold_partial, fold_files),
+                total=len(fold_files),
+                desc="Processing folds",
+            ):
+                results.append(result)
+    else:
+        print("Processing sequentially (no multiprocessing)")
+        results = []
+        for fold_file in tqdm(fold_files, desc="Processing folds"):
+            results.append(process_fold_partial(fold_file))
 
-    for lang, embed_results in fold_davies_bouldin.items():
-        for embed_type, reduction_results in embed_results.items():
-            for reduction_name, scores in reduction_results.items():
-                davies_bouldin_results[lang][embed_type][reduction_name].append(scores)
+    # Print summary
+    print("\nProcessing summary:")
+    for fold_number, count in sorted(results):
+        print(f"  Fold {fold_number}: {count} samples processed")
 
-
-# Calculate statistics across folds
-def calculate_stats(results):
-    stats = {}
-    for lang in results:
-        stats[lang] = {}
-        for embed_type in results[lang]:
-            stats[lang][embed_type] = {}
-            for reduction_name in results[lang][embed_type]:
-                # Filter out None values for each cluster count
-                processed_scores = []
-                for fold_scores in results[lang][embed_type][reduction_name]:
-                    if fold_scores is not None:
-                        processed_scores.append(
-                            [
-                                score if score is not None else np.nan
-                                for score in fold_scores
-                            ]
-                        )
-
-                if not processed_scores:
-                    continue
-
-                # Convert to numpy array for easy stats calculation
-                scores_array = np.array(processed_scores)
-
-                # Calculate mean and standard error, ignoring NaNs
-                mean = np.nanmean(scores_array, axis=0)
-                stderr = stats.sem(scores_array, axis=0, nan_policy="omit")
-
-                stats[lang][embed_type][reduction_name] = {
-                    "mean": mean,
-                    "stderr": stderr,
-                }
-    return stats
+    print(f"\nUMAP projections generation complete. Results saved to {output_dir}/")
 
 
-silhouette_stats = calculate_stats(silhouette_results)
-davies_bouldin_stats = calculate_stats(davies_bouldin_results)
-
-# Save final results
-results_data = {
-    "silhouette_results": silhouette_results,
-    "davies_bouldin_results": davies_bouldin_results,
-    "silhouette_stats": silhouette_stats,
-    "davies_bouldin_stats": davies_bouldin_stats,
-    "parameters": {
-        "N": N,
-        "ONLY_MAIN_LABEL": ONLY_MAIN_LABEL,
-        "min_clusters": min_clusters,
-        "max_clusters": max_clusters,
-        "embedding_types": embedding_types,
-        "languages": list(silhouette_results.keys()),
-    },
-}
-
-results_file = os.path.join(output_dir, "clustering_results.pkl")
-with open(results_file, "wb") as f:
-    pickle.dump(results_data, f)
-print(f"Saved final results to {results_file}")
-print(
-    "\nClustering analysis complete. Use plot_clustering_results.py to visualize the results."
-)
+if __name__ == "__main__":
+    main()
