@@ -1,13 +1,14 @@
-import os
-import pickle
-import numpy as np
 import argparse
 import multiprocessing as mp
-from functools import partial
-from tqdm import tqdm
-import umap
+import os
+import pickle
 import time
 import warnings
+from functools import partial
+
+import numpy as np
+import umap
+from tqdm import tqdm
 
 # Suppress specific UMAP warnings
 warnings.filterwarnings("ignore", category=UserWarning, module="umap")
@@ -150,7 +151,7 @@ def process_fold(fold_file, input_dir, output_dir, umap_dimensions, umap_params)
 
 # Main execution
 def main():
-    print(f"Starting UMAP projections generation...")
+    print("Starting UMAP projections generation...")
     print(f"Input directory: {input_dir}")
     print(f"Output directory: {output_dir}")
 
