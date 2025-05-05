@@ -127,45 +127,22 @@ def calculate_metrics_for_k(data, true_labels, k, random_state):
     cluster_labels = kmeans.fit_predict(data)
 
     # Calculate metrics
-    try:
-        sil_score = silhouette_score(data, cluster_labels)
-    except:
-        sil_score = None
 
-    try:
-        ari_score = adjusted_rand_score(true_labels, cluster_labels)
-    except:
-        ari_score = None
+    sil_score = silhouette_score(data, cluster_labels)
 
-    try:
-        nmi_score = normalized_mutual_info_score(true_labels, cluster_labels)
-    except:
-        nmi_score = None
+    ari_score = adjusted_rand_score(true_labels, cluster_labels)
 
-    try:
-        v_score = v_measure_score(true_labels, cluster_labels)
-    except:
-        v_score = None
+    nmi_score = normalized_mutual_info_score(true_labels, cluster_labels)
 
-    try:
-        homo_score = homogeneity_score(true_labels, cluster_labels)
-    except:
-        homo_score = None
+    v_score = v_measure_score(true_labels, cluster_labels)
 
-    try:
-        comp_score = completeness_score(true_labels, cluster_labels)
-    except:
-        comp_score = None
+    homo_score = homogeneity_score(true_labels, cluster_labels)
 
-    try:
-        db_score = davies_bouldin_score(data, cluster_labels)
-    except:
-        db_score = None
+    comp_score = completeness_score(true_labels, cluster_labels)
 
-    try:
-        ch_score = calinski_harabasz_score(data, cluster_labels)
-    except:
-        ch_score = None
+    db_score = davies_bouldin_score(data, cluster_labels)
+
+    ch_score = calinski_harabasz_score(data, cluster_labels)
 
     return {
         "k": k,
@@ -269,7 +246,7 @@ def process_fold(fold_file, input_dir, output_dir, k_values, random_state):
 
 # Main execution
 def main():
-    print(f"Starting clustering metrics calculation...")
+    print("Starting clustering metrics calculation...")
     print(f"Input directory: {input_dir}")
     print(f"Output directory: {output_dir}")
 
