@@ -1,22 +1,23 @@
-import os
-import pickle
-import numpy as np
 import argparse
 import multiprocessing as mp
+import os
+import pickle
+import time
 from functools import partial
-from tqdm import tqdm
+
+import numpy as np
 from sklearn.cluster import KMeans
 from sklearn.metrics import (
-    silhouette_score,
     adjusted_rand_score,
-    normalized_mutual_info_score,
-    davies_bouldin_score,
     calinski_harabasz_score,
-    homogeneity_score,
     completeness_score,
+    davies_bouldin_score,
+    homogeneity_score,
+    normalized_mutual_info_score,
+    silhouette_score,
     v_measure_score,
 )
-import time
+from tqdm import tqdm
 
 # Parse command line arguments
 parser = argparse.ArgumentParser(
