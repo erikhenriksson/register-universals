@@ -1,4 +1,5 @@
 import argparse
+import concurrent.futures
 import multiprocessing as mp
 import os
 import pickle
@@ -195,8 +196,8 @@ def calculate_metrics_for_k(data, true_labels, k, random_state):
 
 
 # Function to process a single embedding type with all k values
-def process_embedding_with_k_values(task_data, k_values, random_state):
-    embedding_name, data, true_labels = task_data
+def process_embedding_with_k_values(task_data):
+    embedding_name, data, true_labels, k_values, random_state = task_data
     results = []
 
     for k in k_values:
@@ -220,9 +221,8 @@ def process_embeddings(embedding_name, embeddings, true_labels, k_values, random
 
 
 # Function to process a single fold file with parallelization for embeddings
-def process_fold_with_parallelism(
-    fold_file, input_dir, output_dir, k_values, random_state, num_cpus
-):
+def process_fold_with_parallelism(args):
+    fold_file, input_dir, output_dir, k_values, random_state, num_cpus = args
     start_time = time.time()
     fold_name = os.path.basename(fold_file)
     fold_number = fold_name.split("_")[2].split(".")[0]
@@ -247,7 +247,15 @@ def process_fold_with_parallelism(
     for position in ["first", "half", "last"]:
         position_embeddings = embeddings[position]
         # Add raw embeddings task
-        tasks.append((f"{position}_raw", position_embeddings["raw"], true_labels))
+        tasks.append(
+            (
+                f"{position}_raw",
+                position_embeddings["raw"],
+                true_labels,
+                k_values,
+                random_state,
+            )
+        )
 
         # Add UMAP tasks
         for dim in [2, 4, 8, 16, 32]:
@@ -258,26 +266,30 @@ def process_fold_with_parallelism(
                         f"{position}_{umap_key}",
                         position_embeddings[umap_key],
                         true_labels,
+                        k_values,
+                        random_state,
                     )
                 )
             else:
                 print(f"  Warning: {umap_key} not found in {position} embeddings")
 
-    # Process embedding tasks in parallel
+    # Process embedding tasks in parallel using concurrent.futures
     all_metrics = []
-    with mp.Pool(processes=num_cpus) as pool:
-        process_embedding_partial = partial(
-            process_embedding_with_k_values,
-            k_values=k_values,
-            random_state=random_state,
-        )
+    with concurrent.futures.ProcessPoolExecutor(max_workers=num_cpus) as executor:
+        futures = [
+            executor.submit(process_embedding_with_k_values, task) for task in tasks
+        ]
 
-        for result in tqdm(
-            pool.imap_unordered(process_embedding_partial, tasks),
+        for future in tqdm(
+            concurrent.futures.as_completed(futures),
             total=len(tasks),
             desc=f"Processing {fold_name} embeddings",
         ):
-            all_metrics.extend(result)
+            try:
+                result = future.result()
+                all_metrics.extend(result)
+            except Exception as e:
+                print(f"Error processing embedding: {e}")
 
     # Save the results
     output_file = os.path.join(output_dir, f"metrics_fold_{fold_number}.pkl")
@@ -405,7 +417,8 @@ def main():
         f"Running KMeans with k values from {args.min_k} to {args.max_k} (step {args.step_k})"
     )
 
-    # Implement nested parallelism
+    # Implement nested parallelism with ThreadPoolExecutor for top level
+    # and ProcessPoolExecutor for the inner level
     max_parallel_folds = min(args.max_parallel_folds, len(fold_files))
     fold_cpus = max(1, num_workers // max_parallel_folds)
 
@@ -414,25 +427,30 @@ def main():
     print(f"  - Each fold will use up to {fold_cpus} CPUs")
     print(f"  - Total potential utilization: {max_parallel_folds * fold_cpus} CPUs")
 
-    # Create a partial function for processing with the right number of CPUs per fold
-    process_fold_partial = partial(
-        process_fold_with_parallelism,
-        input_dir=input_dir,
-        output_dir=output_dir,
-        k_values=k_values,
-        random_state=args.random_state,
-        num_cpus=fold_cpus,
-    )
+    # Create task arguments for folds
+    fold_tasks = [
+        (fold_file, input_dir, output_dir, k_values, args.random_state, fold_cpus)
+        for fold_file in fold_files
+    ]
 
-    # Process folds in parallel with a limited number of processes
-    with mp.Pool(processes=max_parallel_folds) as pool:
-        results = []
-        for result in tqdm(
-            pool.imap_unordered(process_fold_partial, fold_files),
+    # Use ThreadPoolExecutor for the outer level to avoid the daemon process issue
+    results = []
+    with concurrent.futures.ThreadPoolExecutor(
+        max_workers=max_parallel_folds
+    ) as executor:
+        futures = [
+            executor.submit(process_fold_with_parallelism, task) for task in fold_tasks
+        ]
+
+        for future in tqdm(
+            concurrent.futures.as_completed(futures),
             total=len(fold_files),
             desc="Processing folds",
         ):
-            results.append(result)
+            try:
+                results.append(future.result())
+            except Exception as e:
+                print(f"Error processing fold: {e}")
 
     # Save a combined summary of all folds
     summaries = {fold_number: summary for fold_number, summary in results}
