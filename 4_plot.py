@@ -455,7 +455,7 @@ def plot_umap_scatter(umap_dir):
                         c=[label_colors[label]],
                         label=label,
                         alpha=0.7,
-                        s=40,
+                        s=5,
                         edgecolors="none",
                     )
 
@@ -533,7 +533,7 @@ def plot_umap_scatter(umap_dir):
                         c=[cmap_lang(i)],
                         label=lang,
                         alpha=0.7,
-                        s=40,
+                        s=5,
                         edgecolors="none",
                     )
 
