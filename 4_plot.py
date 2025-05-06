@@ -5,11 +5,7 @@ import pickle
 import matplotlib.pyplot as plt
 import numpy as np
 import seaborn as sns
-import umap
-
-# Add these imports for UMAP plotting
-from sklearn.manifold import TSNE
-from sklearn.preprocessing import StandardScaler
+from matplotlib.colors import ListedColormap
 from tqdm import tqdm
 
 # Set Seaborn style for better aesthetics
@@ -82,23 +78,17 @@ parser.add_argument(
     action="store_true",
     help="Show plots during execution.",
 )
-# Add new arguments for UMAP visualization
 parser.add_argument(
     "--plot_umap",
     action="store_true",
-    help="Generate UMAP visualizations for 2D embeddings.",
+    default=True,
+    help="Generate UMAP 2D scatter plots colored by register (default: True).",
 )
 parser.add_argument(
-    "--embeddings_dir",
+    "--umap_dir",
     type=str,
     default=None,
-    help="Directory containing embeddings data (required for UMAP plotting).",
-)
-parser.add_argument(
-    "--max_samples",
-    type=int,
-    default=5000,
-    help="Maximum number of samples to use for UMAP visualization.",
+    help="Directory containing UMAP data. If None, will use base_dir/umap_data_N_label_type.",
 )
 args = parser.parse_args()
 
@@ -111,11 +101,14 @@ else:
 input_dir = os.path.join(args.base_dir, f"cluster_metrics_{args.N}_{label_type}")
 output_dir = os.path.join(args.base_dir, f"plots_{args.N}_{label_type}")
 
+# Set UMAP directory
+if args.umap_dir is None:
+    umap_dir = os.path.join(args.base_dir, f"umap_data_{args.N}_{label_type}")
+else:
+    umap_dir = args.umap_dir
+
 # Create output directory
 os.makedirs(output_dir, exist_ok=True)
-if args.plot_umap:
-    umap_output_dir = os.path.join(output_dir, "umap_plots")
-    os.makedirs(umap_output_dir, exist_ok=True)
 
 
 def load_metrics_data():
@@ -362,171 +355,215 @@ def plot_metric(metric, processed_data):
             plt.close()
 
 
-def load_embeddings_data(fold_num=0):
-    """
-    Load embeddings and labels from the embeddings directory for a specific fold.
-    Returns embeddings, labels, and language data.
-    """
-    if not args.embeddings_dir:
-        print("Error: embeddings_dir must be specified for UMAP plotting.")
-        return None, None, None
+def get_majority_labels(metadata):
+    """Get the majority label for each sample."""
+    labels = []
+    for item in metadata:
+        # Get only uppercase labels which are the main classes, exclude "MT"
+        main_labels = [
+            label for label in item["preds_0.4"] if label.isupper() and label != "MT"
+        ]
+        if main_labels:
+            # Take the first label as the majority class
+            labels.append(main_labels[0])
+        else:
+            # If no valid labels, use a placeholder
+            labels.append("UNKNOWN")
+    return np.array(labels)
 
-    print(f"Loading embeddings data from {args.embeddings_dir}...")
 
-    # Check if embeddings directory exists
-    if not os.path.exists(args.embeddings_dir):
-        print(f"Error: Embeddings directory {args.embeddings_dir} does not exist.")
-        return None, None, None
+def plot_umap_scatter(umap_dir):
+    """Create scatter plots of 2D UMAP projections colored by register."""
+    print(f"Plotting UMAP 2D projections from {umap_dir}...")
 
-    # Find the embeddings file for the specified fold
-    embedding_files = [
+    # Check if UMAP directory exists
+    if not os.path.exists(umap_dir):
+        print(f"Error: UMAP directory {umap_dir} does not exist.")
+        return
+
+    # List fold files
+    fold_files = [
         f
-        for f in os.listdir(args.embeddings_dir)
-        if f.startswith(f"fold_{fold_num}_") and f.endswith(".pkl")
+        for f in os.listdir(umap_dir)
+        if f.startswith("umap_fold_") and f.endswith(".pkl")
     ]
+    fold_files.sort()
 
-    if not embedding_files:
-        print(f"Error: No embedding files found for fold {fold_num}")
-        return None, None, None
-
-    # Load the first matching file
-    embedding_path = os.path.join(args.embeddings_dir, embedding_files[0])
-    with open(embedding_path, "rb") as f:
-        data = pickle.load(f)
-
-    # Extract embeddings, labels, and languages
-    embeddings = data.get("embeddings", {})
-    labels = data.get("labels", [])
-    languages = data.get("languages", [])
-
-    return embeddings, labels, languages
-
-
-def plot_umap_visualization():
-    """
-    Create UMAP visualizations for 2D embeddings.
-    This plots actual data points in 2D space with colors based on labels.
-    """
-    if not args.plot_umap:
+    if not fold_files:
+        print(f"Error: No UMAP fold files found in {umap_dir}")
         return
 
-    print("Generating UMAP visualizations...")
+    print(f"Found {len(fold_files)} UMAP fold files to process")
 
-    # Load embeddings data (using fold 0 by default)
-    embeddings, labels, languages = load_embeddings_data(fold_num=0)
-    if embeddings is None:
-        return
+    # Process each fold
+    for fold_file in tqdm(fold_files, desc="Creating UMAP plots"):
+        fold_path = os.path.join(umap_dir, fold_file)
+        fold_number = fold_file.split("_")[2].split(".")[0]
 
-    # Process each embedding position
-    for position in args.embedding_positions:
-        # We'll only visualize the 2D UMAP embeddings
-        embed_name = f"{position}_umap_2d"
+        try:
+            # Load the fold data
+            with open(fold_path, "rb") as f:
+                fold_data = pickle.load(f)
 
-        if embed_name not in embeddings:
-            print(f"Warning: {embed_name} not found in embeddings data, skipping.")
-            continue
+            metadata = fold_data.get("metadata", [])
+            embeddings = fold_data.get("embeddings", {})
 
-        embed_data = embeddings[embed_name]
+            if not metadata or not embeddings:
+                print(f"Warning: Missing metadata or embeddings in {fold_file}")
+                continue
 
-        # Subsample if needed
-        if len(embed_data) > args.max_samples:
-            indices = np.random.choice(len(embed_data), args.max_samples, replace=False)
-            embed_data = embed_data[indices]
-            sampled_labels = [labels[i] for i in indices]
-            if languages:
-                sampled_languages = [languages[i] for i in indices]
-        else:
-            sampled_labels = labels
-            if languages:
-                sampled_languages = languages
+            # Get labels for coloring points
+            labels = get_majority_labels(metadata)
+            unique_labels = np.unique(labels)
 
-        # Convert labels to numeric form if they're strings
-        unique_labels = sorted(set(sampled_labels))
-        label_to_id = {label: i for i, label in enumerate(unique_labels)}
-        numeric_labels = np.array([label_to_id[label] for label in sampled_labels])
-
-        # 1. Plot by labels
-        plt.figure(figsize=(12, 10))
-        scatter = plt.scatter(
-            embed_data[:, 0],
-            embed_data[:, 1],
-            c=numeric_labels,
-            cmap="tab20",
-            alpha=0.7,
-            s=30,
-        )
-
-        # Add a legend
-        if len(unique_labels) <= 20:  # Only show legend if not too many labels
-            legend1 = plt.legend(
-                *scatter.legend_elements(),
-                loc="upper right",
-                title="Labels",
-                bbox_to_anchor=(1.15, 1),
-            )
-            plt.gca().add_artist(legend1)
-
-        plt.title(f"UMAP 2D Visualization by Label ({position} embeddings)")
-        plt.xlabel("UMAP Dimension 1")
-        plt.ylabel("UMAP Dimension 2")
-        plt.tight_layout()
-
-        # Save plot
-        output_file = os.path.join(
-            umap_output_dir, f"umap_2d_{position}_by_label.{args.output_format}"
-        )
-        plt.savefig(output_file, dpi=args.dpi, bbox_inches="tight")
-        print(f"Saved UMAP plot to {output_file}")
-
-        if args.show_plots:
-            plt.show()
-        else:
-            plt.close()
-
-        # 2. If language data is available, plot by language
-        if languages:
-            plt.figure(figsize=(12, 10))
-
-            # Convert languages to numeric form
-            unique_langs = sorted(set(sampled_languages))
-            lang_to_id = {lang: i for i, lang in enumerate(unique_langs)}
-            numeric_langs = np.array([lang_to_id[lang] for lang in sampled_languages])
-
-            scatter = plt.scatter(
-                embed_data[:, 0],
-                embed_data[:, 1],
-                c=numeric_langs,
-                cmap="tab10",
-                alpha=0.7,
-                s=30,
-            )
-
-            # Add a legend
-            if len(unique_langs) <= 10:  # Only show legend if not too many languages
-                legend1 = plt.legend(
-                    *scatter.legend_elements(),
-                    loc="upper right",
-                    title="Languages",
-                    bbox_to_anchor=(1.15, 1),
-                )
-                plt.gca().add_artist(legend1)
-
-            plt.title(f"UMAP 2D Visualization by Language ({position} embeddings)")
-            plt.xlabel("UMAP Dimension 1")
-            plt.ylabel("UMAP Dimension 2")
-            plt.tight_layout()
-
-            # Save plot
-            output_file = os.path.join(
-                umap_output_dir, f"umap_2d_{position}_by_language.{args.output_format}"
-            )
-            plt.savefig(output_file, dpi=args.dpi, bbox_inches="tight")
-            print(f"Saved UMAP plot to {output_file}")
-
-            if args.show_plots:
-                plt.show()
+            # Create a colormap for the labels
+            num_labels = len(unique_labels)
+            if num_labels <= 10:
+                # Use a categorical palette for few labels
+                cmap = plt.cm.get_cmap("tab10", num_labels)
             else:
-                plt.close()
+                # Use a continuous colormap for many labels
+                cmap = plt.cm.get_cmap("hsv", num_labels)
+
+            # Create a dictionary mapping labels to colors
+            label_colors = {label: cmap(i) for i, label in enumerate(unique_labels)}
+
+            # Create scatter plots for each position (first, half, last)
+            for position in args.embedding_positions:
+                if position not in embeddings:
+                    print(f"Warning: Position {position} not found in embeddings")
+                    continue
+
+                position_embeddings = embeddings[position]
+
+                # Get 2D UMAP projections
+                if "umap_2d" not in position_embeddings:
+                    print(f"Warning: 2D UMAP not found for {position} embeddings")
+                    continue
+
+                umap_2d = position_embeddings["umap_2d"]
+
+                # Create figure
+                plt.figure(figsize=(12, 10))
+
+                # Plot each label with its own color
+                for label in unique_labels:
+                    mask = labels == label
+                    plt.scatter(
+                        umap_2d[mask, 0],
+                        umap_2d[mask, 1],
+                        c=[label_colors[label]],
+                        label=label,
+                        alpha=0.7,
+                        s=40,
+                        edgecolors="none",
+                    )
+
+                # Add labels and legend
+                plt.title(
+                    f"2D UMAP Projection ({position} embeddings), Fold {fold_number}"
+                )
+                plt.xlabel("UMAP Dimension 1")
+                plt.ylabel("UMAP Dimension 2")
+
+                # Add legend with reasonable size and position
+                if num_labels <= 20:
+                    # Full legend for manageable number of labels
+                    plt.legend(
+                        title="Register",
+                        loc="best",
+                        bbox_to_anchor=(1.05, 1),
+                        fontsize=10,
+                    )
+                else:
+                    # Create a more compact legend for many labels
+                    plt.legend(
+                        title="Register",
+                        loc="center left",
+                        bbox_to_anchor=(1.05, 0.5),
+                        fontsize=8,
+                        ncol=2,
+                    )
+
+                plt.tight_layout()
+
+                # Save plot
+                output_file = os.path.join(
+                    output_dir,
+                    f"umap_2d_{position}_fold_{fold_number}.{args.output_format}",
+                )
+                plt.savefig(output_file, dpi=args.dpi, bbox_inches="tight")
+                print(f"Saved plot to {output_file}")
+
+                # Show plot if requested
+                if args.show_plots:
+                    plt.show()
+                else:
+                    plt.close()
+
+            # Create aggregate plot of all languages for each position
+            for position in args.embedding_positions:
+                if position not in embeddings:
+                    continue
+
+                position_embeddings = embeddings[position]
+
+                if "umap_2d" not in position_embeddings:
+                    continue
+
+                umap_2d = position_embeddings["umap_2d"]
+
+                # Get language info for each point
+                languages = np.array([item["lang"] for item in metadata])
+                unique_languages = np.unique(languages)
+
+                # Create a colormap for languages
+                num_languages = len(unique_languages)
+                cmap_lang = plt.cm.get_cmap("Set1", max(num_languages, 9))
+
+                # Create figure
+                plt.figure(figsize=(12, 10))
+
+                # Plot each language with its own color
+                for i, lang in enumerate(unique_languages):
+                    mask = languages == lang
+                    plt.scatter(
+                        umap_2d[mask, 0],
+                        umap_2d[mask, 1],
+                        c=[cmap_lang(i)],
+                        label=lang,
+                        alpha=0.7,
+                        s=40,
+                        edgecolors="none",
+                    )
+
+                # Add labels and legend
+                plt.title(
+                    f"2D UMAP by Language ({position} embeddings), Fold {fold_number}"
+                )
+                plt.xlabel("UMAP Dimension 1")
+                plt.ylabel("UMAP Dimension 2")
+                plt.legend(title="Language", loc="best")
+                plt.tight_layout()
+
+                # Save plot
+                output_file = os.path.join(
+                    output_dir,
+                    f"umap_2d_{position}_lang_fold_{fold_number}.{args.output_format}",
+                )
+                plt.savefig(output_file, dpi=args.dpi, bbox_inches="tight")
+                print(f"Saved plot to {output_file}")
+
+                # Show plot if requested
+                if args.show_plots:
+                    plt.show()
+                else:
+                    plt.close()
+
+        except Exception as e:
+            print(f"Error processing UMAP file {fold_file}: {e}")
+
+    print("UMAP plotting complete.")
 
 
 def main():
@@ -536,26 +573,33 @@ def main():
     print(f"Output directory: {output_dir}")
     print(f"Metrics to plot: {args.metrics}")
 
+    # Plot metrics
+    print("\n=== PLOTTING CLUSTERING METRICS ===")
+
     # Load metrics data
     all_data = load_metrics_data()
     if all_data is None:
-        return
+        print("Error loading metrics data, skipping metrics plots.")
+    else:
+        # Process metrics data
+        processed_data = process_metrics_data(all_data)
 
-    # Process metrics data
-    processed_data = process_metrics_data(all_data)
-
-    # Plot each requested metric
-    for metric in args.metrics:
-        plot_metric(metric, processed_data)
+        # Plot each requested metric
+        for metric in args.metrics:
+            plot_metric(metric, processed_data)
 
     # Plot UMAP visualizations if requested
     if args.plot_umap:
-        if not args.embeddings_dir:
-            print("Warning: --embeddings_dir must be specified for UMAP plotting.")
-        else:
-            plot_umap_visualization()
+        print("\n=== PLOTTING UMAP VISUALIZATIONS ===")
+        print(f"UMAP data directory: {umap_dir}")
 
-    print(f"Plot generation complete. Results saved to {output_dir}/")
+        if not os.path.exists(umap_dir):
+            print(f"Error: UMAP directory {umap_dir} does not exist.")
+            print("Skipping UMAP plots.")
+        else:
+            plot_umap_scatter(umap_dir)
+
+    print(f"\nPlot generation complete. Results saved to {output_dir}/")
 
 
 if __name__ == "__main__":
