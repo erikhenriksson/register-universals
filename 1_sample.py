@@ -1,18 +1,19 @@
-import os
-import csv
+import argparse
 import ast
+import csv
+import multiprocessing as mp
+import os
 import pickle
 import random
-import numpy as np
-from collections import defaultdict
-from tqdm import tqdm
-import argparse
-import multiprocessing as mp
-from functools import partial
 import sys
+from collections import defaultdict
+from functools import partial
+
+import numpy as np
+from tqdm import tqdm
 
 # Increase CSV field size limit to maximum integer size
-csv.field_size_limit(2147483647)  # Use a large but safe integer value
+csv.field_size_limit(sys.maxsize)
 
 # Parse command line arguments
 parser = argparse.ArgumentParser(description="Sample data from TSV files.")
@@ -103,24 +104,27 @@ def process_fold(fold_dir, base_dir, languages, N, ONLY_MAIN_LABEL, output_dir):
             # Apply filtering based on ONLY_MAIN_LABEL
             if ONLY_MAIN_LABEL:
                 # Only keep examples with a single uppercase (main) label, excluding "MT"
-                main_labels = [label for label in preds_0_4 if label.isupper()]
-                if len(main_labels) == 1 and main_labels[0] != "MT":
-                    label = main_labels[0]
+                if len(preds_0_4) == 1 and preds_0_4[0] != "MT":
+                    label = preds_0_4[0]
                     label_groups[label].append(row)
             else:
                 # Remove lowercase labels and "MT", then check if there's only one left
                 filtered_labels = [
-                    label
-                    for label in preds_0_4
-                    if not label.islower() and label != "MT"
+                    label for label in preds_0_4 if label.isupper() and label != "MT"
                 ]
                 if len(filtered_labels) == 1:
                     label = filtered_labels[0]
                     label_groups[label].append(row)
 
-        # Sample N rows for each label (or all if less than N)
+        # Sample N rows for each label (upsample if fewer than N)
         for label, group in label_groups.items():
-            sampled = random.sample(group, min(N, len(group)))
+            if len(group) >= N:
+                # Downsample if we have more than N
+                sampled = random.sample(group, N)
+            else:
+                # Upsample if we have fewer than N
+                # We'll need to sample with replacement to get N items
+                sampled = random.choices(group, k=N)
 
             # Track statistics
             fold_stats[lang][label] = len(sampled)
