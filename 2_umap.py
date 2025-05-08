@@ -35,10 +35,10 @@ parser.add_argument(
     help="Random state for UMAP for reproducibility.",
 )
 parser.add_argument(
-    "--n_neighbors", type=int, default=15, help="n_neighbors parameter for UMAP."
+    "--n_neighbors", type=int, default=50, help="n_neighbors parameter for UMAP."
 )
 parser.add_argument(
-    "--min_dist", type=float, default=0.1, help="min_dist parameter for UMAP."
+    "--min_dist", type=float, default=0.0, help="min_dist parameter for UMAP."
 )
 parser.add_argument(
     "--base_dir",
