@@ -199,6 +199,7 @@ def calculate_metrics_for_k(data, true_labels, k, random_state):
             "completeness": None,
             "davies_bouldin": None,
             "calinski_harabasz": None,
+            "cluster_labels": None,  # Add this line
         }
 
     # Fit KMeans
@@ -225,6 +226,7 @@ def calculate_metrics_for_k(data, true_labels, k, random_state):
         "completeness": comp_score,
         "davies_bouldin": db_score,
         "calinski_harabasz": ch_score,
+        "cluster_labels": cluster_labels,  # Add this line
     }
 
 
