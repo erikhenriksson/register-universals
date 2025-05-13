@@ -35,13 +35,13 @@ parser = argparse.ArgumentParser(
 parser.add_argument(
     "--blas_threads",
     type=int,
-    default=1,
+    default=16,
     help="Number of threads for BLAS operations per process. Default is 1 to prevent thread explosion.",
 )
 parser.add_argument(
     "--max_total_processes",
     type=int,
-    default=128,
+    default=256,
     help="Maximum total number of processes to use, to prevent OpenBLAS errors on large systems.",
 )
 parser.add_argument(
