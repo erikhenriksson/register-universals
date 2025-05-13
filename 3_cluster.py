@@ -3,7 +3,6 @@ import multiprocessing as mp
 import os
 import pickle
 import time
-import warnings
 from concurrent.futures import ProcessPoolExecutor
 from functools import partial
 
@@ -28,6 +27,10 @@ from sklearn.metrics import (
 )
 from tqdm import tqdm
 
+# Parse command line arguments
+parser = argparse.ArgumentParser(
+    description="Calculate clustering metrics on UMAP projections."
+)
 # Add OpenBLAS control parameters
 parser.add_argument(
     "--blas_threads",
@@ -40,6 +43,12 @@ parser.add_argument(
     type=int,
     default=64,
     help="Maximum total number of processes to use, to prevent OpenBLAS errors on large systems.",
+)
+parser.add_argument(
+    "--N",
+    type=int,
+    default=1000,
+    help="Number of samples per label per language (used for directory naming).",
 )
 parser.add_argument(
     "--ONLY_MAIN_LABEL",
@@ -153,6 +162,7 @@ print(f"  Using {effective_cpus} CPUs ({args.cpu_fraction * 100:.0f}% of availab
 print(f"  Processing {fold_workers} folds in parallel")
 print(f"  Using {embedding_workers} workers per fold for embedding parallelism")
 print(f"  Effective CPUs per fold: ~{cpus_per_fold}")
+print(f"  BLAS threads per process: {args.blas_threads}")
 
 # Define the range of k values
 k_values = range(args.min_k, args.max_k + 1, args.step_k)
