@@ -30,10 +30,10 @@ parser.add_argument(
     help="Number of fold-level parallel processes to use.",
 )
 parser.add_argument(
-    "--kmeans_jobs",
+    "--threads_per_worker",
     type=int,
-    default=-1,
-    help="Number of parallel jobs for KMeans. Default is -1 (all CPUs).",
+    default=4,
+    help="Number of threads for each worker to use.",
 )
 parser.add_argument(
     "--N",
@@ -106,7 +106,7 @@ def get_majority_labels(metadata):
 
 
 # Function to calculate metrics for a specific embedding and k value
-def calculate_metrics_for_k(data, true_labels, k, random_state, n_jobs):
+def calculate_metrics_for_k(data, true_labels, k, random_state):
     # Skip if number of samples is less than k
     if len(data) <= k:
         return {
@@ -121,10 +121,8 @@ def calculate_metrics_for_k(data, true_labels, k, random_state, n_jobs):
             "calinski_harabasz": None,
         }
 
-    # Fit KMeans with specified n_jobs for parallelism
-    kmeans = KMeans(
-        n_clusters=k, random_state=random_state, n_init="auto", n_jobs=n_jobs
-    )
+    # Fit KMeans - compatible with scikit-learn 1.6.1
+    kmeans = KMeans(n_clusters=k, random_state=random_state, n_init="auto")
     cluster_labels = kmeans.fit_predict(data)
 
     # Calculate metrics
@@ -150,8 +148,18 @@ def calculate_metrics_for_k(data, true_labels, k, random_state, n_jobs):
     }
 
 
+# Worker initialization function to set thread limits
+def init_worker(threads):
+    # Set threading environment variables for this worker process
+    os.environ["OMP_NUM_THREADS"] = str(threads)
+    os.environ["OPENBLAS_NUM_THREADS"] = str(threads)
+    os.environ["MKL_NUM_THREADS"] = str(threads)
+    os.environ["VECLIB_MAXIMUM_THREADS"] = str(threads)
+    os.environ["NUMEXPR_NUM_THREADS"] = str(threads)
+
+
 # Function to process a single fold file
-def process_fold(fold_file, input_dir, output_dir, k_values, random_state, kmeans_jobs):
+def process_fold(fold_file, input_dir, output_dir, k_values, random_state):
     start_time = time.time()
     fold_name = os.path.basename(fold_file)
     fold_number = fold_name.split("_")[2].split(".")[0]
@@ -179,9 +187,7 @@ def process_fold(fold_file, input_dir, output_dir, k_values, random_state, kmean
     embedding_types = ["raw"] + [f"umap_{dim}d" for dim in [2, 4, 8, 16, 32]]
 
     total_embeddings = len(positions) * len(embedding_types)
-    print(
-        f"  Processing {total_embeddings} embedding types sequentially, using KMeans parallelism (n_jobs={kmeans_jobs})"
-    )
+    print(f"  Processing {total_embeddings} embedding types sequentially...")
 
     # Process each embedding type
     for position in positions:
@@ -191,7 +197,7 @@ def process_fold(fold_file, input_dir, output_dir, k_values, random_state, kmean
         print(f"  Processing {position}_raw...")
         for k in k_values:
             metrics = calculate_metrics_for_k(
-                position_embeddings["raw"], true_labels, k, random_state, kmeans_jobs
+                position_embeddings["raw"], true_labels, k, random_state
             )
             metrics["embedding"] = f"{position}_raw"
             all_metrics.append(metrics)
@@ -202,11 +208,7 @@ def process_fold(fold_file, input_dir, output_dir, k_values, random_state, kmean
             print(f"  Processing {position}_{umap_key}...")
             for k in k_values:
                 metrics = calculate_metrics_for_k(
-                    position_embeddings[umap_key],
-                    true_labels,
-                    k,
-                    random_state,
-                    kmeans_jobs,
+                    position_embeddings[umap_key], true_labels, k, random_state
                 )
                 metrics["embedding"] = f"{position}_{umap_key}"
                 all_metrics.append(metrics)
@@ -240,7 +242,7 @@ def main():
     print(f"Input directory: {input_dir}")
     print(f"Output directory: {output_dir}")
     print(f"Using {args.max_workers} parallel workers for folds")
-    print(f"Using {args.kmeans_jobs} cores for KMeans")
+    print(f"Using {args.threads_per_worker} threads per worker")
 
     # Check if input directory exists
     if not os.path.exists(input_dir):
@@ -271,7 +273,6 @@ def main():
         output_dir=output_dir,
         k_values=k_values,
         random_state=args.random_state,
-        kmeans_jobs=args.kmeans_jobs,
     )
 
     # Process folds in parallel
@@ -281,10 +282,17 @@ def main():
     print(f"Processing folds with {num_workers} parallel workers")
 
     if num_workers > 1:
-        with ProcessPoolExecutor(max_workers=num_workers) as executor:
+        # Use the initializer to set thread limits for each worker process
+        with ProcessPoolExecutor(
+            max_workers=num_workers,
+            initializer=init_worker,
+            initargs=(args.threads_per_worker,),
+        ) as executor:
             # Using list() to ensure we wait for all tasks to complete
             results = list(executor.map(process_fold_partial, fold_files))
     else:
+        # For single worker, set thread limits in the main process
+        init_worker(args.threads_per_worker)
         print("Processing folds sequentially")
         results = []
         for fold_file in tqdm(fold_files, desc="Processing folds"):
