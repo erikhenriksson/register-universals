@@ -109,11 +109,12 @@ def process_fold(fold_dir, base_dir, languages, N, ONLY_MAIN_LABEL, output_dir):
                     label_groups[label].append(row)
             else:
                 # Remove lowercase labels and "MT", then check if there's only one left
-                filtered_labels = [
+                filtered_labels_main = [
                     label for label in preds_0_4 if label.isupper() and label != "MT"
                 ]
-                if len(filtered_labels) == 1:
-                    label = filtered_labels[0]
+                filtered_labels_sub = [label for label in preds_0_4 if label.islower()]
+                if len(filtered_labels_main) == 1 and len(filtered_labels_sub) < 2:
+                    label = filtered_labels_main[0]
                     label_groups[label].append(row)
 
         # Sample N rows for each label (upsample if fewer than N)
