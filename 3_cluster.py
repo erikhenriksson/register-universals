@@ -2,7 +2,6 @@ import argparse
 import os
 import pickle
 import time
-from concurrent.futures import ProcessPoolExecutor
 from functools import partial
 
 import numpy as np
@@ -24,16 +23,10 @@ parser = argparse.ArgumentParser(
     description="Calculate clustering metrics on UMAP projections."
 )
 parser.add_argument(
-    "--max_workers",
+    "--threads",
     type=int,
-    default=4,  # Reduced from 10 to 4
-    help="Number of fold-level parallel processes to use.",
-)
-parser.add_argument(
-    "--threads_per_worker",
-    type=int,
-    default=16,  # Increased from 4 to 16
-    help="Number of threads for each worker to use.",
+    default=60,  # Just below the 64 limit
+    help="Number of threads to use for calculations.",
 )
 parser.add_argument(
     "--N",
@@ -70,6 +63,18 @@ parser.add_argument(
 parser.add_argument(
     "--step_k", type=int, default=1, help="Step size for k values in KMeans."
 )
+parser.add_argument(
+    "--start_fold",
+    type=int,
+    default=1,
+    help="Fold number to start processing from (1-based).",
+)
+parser.add_argument(
+    "--end_fold",
+    type=int,
+    default=None,
+    help="Fold number to end processing at (inclusive, 1-based). If None, process all folds.",
+)
 args = parser.parse_args()
 
 # Setup directory paths
@@ -86,6 +91,15 @@ os.makedirs(output_dir, exist_ok=True)
 
 # Define the range of k values
 k_values = range(args.min_k, args.max_k + 1, args.step_k)
+
+# Set strict thread limits - do this EARLY before numpy is initialized
+threads = min(args.threads, 60)  # Cap at 60 to stay safely under 64
+print(f"Setting thread limit to {threads}")
+os.environ["OMP_NUM_THREADS"] = str(threads)
+os.environ["OPENBLAS_NUM_THREADS"] = str(threads)
+os.environ["MKL_NUM_THREADS"] = str(threads)
+os.environ["VECLIB_MAXIMUM_THREADS"] = str(threads)
+os.environ["NUMEXPR_NUM_THREADS"] = str(threads)
 
 
 # Function to get the most common label for each sample
@@ -121,18 +135,9 @@ def calculate_metrics_for_k(data, true_labels, k, random_state):
             "calinski_harabasz": None,
         }
 
-    # Reset threading limits for this specific function
-    # This is a defensive measure to ensure thread limits are respected
-    thread_limit = int(os.environ.get("OMP_NUM_THREADS", "1"))
-    os.environ["MKL_NUM_THREADS"] = str(thread_limit)
-    os.environ["OPENBLAS_NUM_THREADS"] = str(thread_limit)
-    os.environ["VECLIB_MAXIMUM_THREADS"] = str(thread_limit)
-    os.environ["NUMEXPR_NUM_THREADS"] = str(thread_limit)
-
-    # Fit KMeans with explicit thread control
     try:
-        # Using n_init=10 instead of "auto" for more stability
-        kmeans = KMeans(n_clusters=k, random_state=random_state, n_init=10)
+        # Fit KMeans - use n_init=1 to reduce thread contention
+        kmeans = KMeans(n_clusters=k, random_state=random_state, n_init=1)
         cluster_labels = kmeans.fit_predict(data)
 
         # Calculate metrics
@@ -173,34 +178,28 @@ def calculate_metrics_for_k(data, true_labels, k, random_state):
         }
 
 
-# Worker initialization function to set thread limits
-def init_worker(threads):
-    # Set a strict threading limit for this worker process
-    print(f"Initializing worker with {threads} threads")
-    os.environ["OMP_NUM_THREADS"] = str(threads)
-    os.environ["OPENBLAS_NUM_THREADS"] = str(threads)
-    os.environ["MKL_NUM_THREADS"] = str(threads)
-    os.environ["VECLIB_MAXIMUM_THREADS"] = str(threads)
-    os.environ["NUMEXPR_NUM_THREADS"] = str(threads)
-
-    # Force numpy to acknowledge the thread settings
-    # This is critical for OpenBLAS control
-    np_config = np.__config__
-    if hasattr(np_config, "show"):
-        np_config.show()
-
-
 # Function to process a single fold file
 def process_fold(fold_file, input_dir, output_dir, k_values, random_state):
-    # Additional defensive measure to ensure thread settings are applied
-    threads = int(os.environ.get("OMP_NUM_THREADS", "1"))
-    print(f"Processing {fold_file} with {threads} threads")
-
     start_time = time.time()
     fold_name = os.path.basename(fold_file)
     fold_number = fold_name.split("_")[2].split(".")[0]
 
     print(f"Processing {fold_name}...")
+
+    # Check if this fold has already been processed
+    output_file = os.path.join(output_dir, f"metrics_fold_{fold_number}.pkl")
+    if os.path.exists(output_file):
+        print(f"  Fold {fold_number} already processed, skipping.")
+        with open(output_file, "rb") as f:
+            all_metrics = pickle.load(f)
+
+        # Create a summary of the results
+        summary = {
+            "fold": fold_number,
+            "num_samples": "unknown (skipped)",
+            "unique_labels": "unknown (skipped)",
+        }
+        return fold_number, summary
 
     # Load the fold data
     fold_path = os.path.join(input_dir, fold_file)
@@ -234,6 +233,14 @@ def process_fold(fold_file, input_dir, output_dir, k_values, random_state):
             metrics["embedding"] = f"{position}_raw"
             all_metrics.append(metrics)
 
+        # Save intermediate results after raw embeddings
+        intermediate_file = os.path.join(
+            output_dir, f"metrics_fold_{fold_number}_partial_{position}_raw.pkl"
+        )
+        with open(intermediate_file, "wb") as f:
+            pickle.dump(all_metrics, f)
+        print(f"  Saved intermediate results to {intermediate_file}")
+
         # Process UMAP projections - one at a time
         for dim in [2, 4, 8, 16, 32]:
             umap_key = f"umap_{dim}d"
@@ -246,7 +253,6 @@ def process_fold(fold_file, input_dir, output_dir, k_values, random_state):
                 all_metrics.append(metrics)
 
             # Save intermediate results after each embedding type
-            # This provides checkpointing in case of failures
             intermediate_file = os.path.join(
                 output_dir,
                 f"metrics_fold_{fold_number}_partial_{position}_{umap_key}.pkl",
@@ -256,7 +262,6 @@ def process_fold(fold_file, input_dir, output_dir, k_values, random_state):
             print(f"  Saved intermediate results to {intermediate_file}")
 
     # Save the final results
-    output_file = os.path.join(output_dir, f"metrics_fold_{fold_number}.pkl")
     with open(output_file, "wb") as f:
         pickle.dump(all_metrics, f)
 
@@ -283,15 +288,7 @@ def main():
     print(f"Starting clustering metrics calculation...")
     print(f"Input directory: {input_dir}")
     print(f"Output directory: {output_dir}")
-    print(f"Using {args.max_workers} parallel workers for folds")
-    print(f"Using {args.threads_per_worker} threads per worker")
-
-    # Pre-configure main process thread settings
-    os.environ["OMP_NUM_THREADS"] = str(args.threads_per_worker)
-    os.environ["OPENBLAS_NUM_THREADS"] = str(args.threads_per_worker)
-    os.environ["MKL_NUM_THREADS"] = str(args.threads_per_worker)
-    os.environ["VECLIB_MAXIMUM_THREADS"] = str(args.threads_per_worker)
-    os.environ["NUMEXPR_NUM_THREADS"] = str(args.threads_per_worker)
+    print(f"Using {args.threads} threads")
 
     # Check if input directory exists
     if not os.path.exists(input_dir):
@@ -310,12 +307,23 @@ def main():
         print(f"Error: No fold files found in {input_dir}")
         return
 
+    # Filter fold files based on start_fold and end_fold arguments
+    if args.start_fold > 1:
+        start_idx = args.start_fold - 1  # Convert to 0-based index
+        fold_files = fold_files[start_idx:]
+        print(f"Starting from fold {args.start_fold}")
+
+    if args.end_fold is not None:
+        end_idx = args.end_fold  # Convert to 0-based index
+        fold_files = fold_files[: end_idx - args.start_fold + 1]
+        print(f"Ending at fold {args.end_fold}")
+
     print(f"Found {len(fold_files)} fold files to process")
     print(
         f"Running KMeans with k values from {args.min_k} to {args.max_k} (step {args.step_k})"
     )
 
-    # Set up the process pool and run the processing
+    # Set up the process function
     process_fold_partial = partial(
         process_fold,
         input_dir=input_dir,
@@ -324,38 +332,39 @@ def main():
         random_state=args.random_state,
     )
 
-    # Process folds in parallel - but with fewer workers
-    num_workers = min(args.max_workers, len(fold_files))
-    print(f"Processing folds with {num_workers} parallel workers")
+    # Process folds sequentially
+    print("Processing folds sequentially")
+    results = []
 
     try:
-        if num_workers > 1:
-            # Use the initializer to set thread limits for each worker process
-            with ProcessPoolExecutor(
-                max_workers=num_workers,
-                initializer=init_worker,
-                initargs=(args.threads_per_worker,),
-            ) as executor:
-                # Process folds in chunks to avoid overwhelming OpenBLAS
-                chunk_size = min(3, num_workers)  # Process at most 3 folds at once
-                print(f"Processing in chunks of {chunk_size} folds")
+        for fold_file in tqdm(fold_files, desc="Processing folds"):
+            result = process_fold_partial(fold_file)
+            results.append(result)
 
-                # Process files in chunks
-                results = []
-                for i in range(0, len(fold_files), chunk_size):
-                    chunk = fold_files[i : i + chunk_size]
-                    print(f"Processing chunk {i // chunk_size + 1}: {chunk}")
-                    chunk_results = list(executor.map(process_fold_partial, chunk))
-                    results.extend(chunk_results)
-        else:
-            # For single worker, set thread limits in the main process
-            init_worker(args.threads_per_worker)
-            print("Processing folds sequentially")
-            results = []
-            for fold_file in tqdm(fold_files, desc="Processing folds"):
-                results.append(process_fold_partial(fold_file))
+            # Save partial summary after each fold
+            summaries = {fold_number: summary for fold_number, summary in results}
+            summary_file = os.path.join(output_dir, "fold_summaries_partial.pkl")
+            with open(summary_file, "wb") as f:
+                pickle.dump(summaries, f)
+            print(f"Updated partial summaries in {summary_file}")
 
-        # Save a combined summary of all folds
+    except Exception as e:
+        print(f"Error in processing: {str(e)}")
+        import traceback
+
+        traceback.print_exc()
+
+        # Save whatever results we have so far
+        if results:
+            print("Saving partial results...")
+            summaries = {fold_number: summary for fold_number, summary in results}
+            summary_file = os.path.join(output_dir, "fold_summaries_partial.pkl")
+            with open(summary_file, "wb") as f:
+                pickle.dump(summaries, f)
+            print(f"Partial results saved to {summary_file}")
+
+    # If we completed all folds successfully, save the final summary
+    if len(results) == len(fold_files):
         summaries = {fold_number: summary for fold_number, summary in results}
         summary_file = os.path.join(output_dir, "fold_summaries.pkl")
         with open(summary_file, "wb") as f:
@@ -364,19 +373,16 @@ def main():
         # Print summary
         print("\nProcessing summary:")
         for fold_number, summary in sorted(results, key=lambda x: x[0]):
-            print(
-                f"  Fold {fold_number}: {summary['num_samples']} samples, {summary['unique_labels']} unique labels"
-            )
+            if isinstance(summary["num_samples"], str):
+                print(f"  Fold {fold_number}: {summary['num_samples']}")
+            else:
+                print(
+                    f"  Fold {fold_number}: {summary['num_samples']} samples, {summary['unique_labels']} unique labels"
+                )
 
         print(
             f"\nClustering metrics calculation complete. Results saved to {output_dir}/"
         )
-
-    except Exception as e:
-        print(f"Error in main processing: {str(e)}")
-        import traceback
-
-        traceback.print_exc()
 
 
 if __name__ == "__main__":
