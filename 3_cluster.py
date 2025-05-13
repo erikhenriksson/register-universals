@@ -1,17 +1,9 @@
 import argparse
-import multiprocessing as mp
 import os
 import pickle
 import time
 from concurrent.futures import ProcessPoolExecutor
 from functools import partial
-
-# Control OpenBLAS thread usage to prevent thread explosion
-os.environ["OMP_NUM_THREADS"] = "1"  # OpenMP threads
-os.environ["OPENBLAS_NUM_THREADS"] = "1"  # OpenBLAS threads
-os.environ["MKL_NUM_THREADS"] = "1"  # MKL threads
-os.environ["VECLIB_MAXIMUM_THREADS"] = "1"  # Accelerate threads
-os.environ["NUMEXPR_NUM_THREADS"] = "1"  # Numexpr threads
 
 import numpy as np
 from sklearn.cluster import KMeans
@@ -31,18 +23,17 @@ from tqdm import tqdm
 parser = argparse.ArgumentParser(
     description="Calculate clustering metrics on UMAP projections."
 )
-# Add OpenBLAS control parameters
 parser.add_argument(
-    "--blas_threads",
+    "--max_workers",
     type=int,
-    default=16,
-    help="Number of threads for BLAS operations per process. Default is 1 to prevent thread explosion.",
+    default=10,
+    help="Number of fold-level parallel processes to use.",
 )
 parser.add_argument(
-    "--max_total_processes",
+    "--kmeans_jobs",
     type=int,
-    default=256,
-    help="Maximum total number of processes to use, to prevent OpenBLAS errors on large systems.",
+    default=-1,
+    help="Number of parallel jobs for KMeans. Default is -1 (all CPUs).",
 )
 parser.add_argument(
     "--N",
@@ -68,24 +59,6 @@ parser.add_argument(
     help="Base directory containing umap data directories.",
 )
 parser.add_argument(
-    "--cpu_fraction",
-    type=float,
-    default=0.9,
-    help="Fraction of CPUs to use for parallel processing (0.0-1.0).",
-)
-parser.add_argument(
-    "--fold_workers",
-    type=int,
-    default=None,
-    help="Number of worker processes for fold-level parallelism. If None, calculated automatically.",
-)
-parser.add_argument(
-    "--embedding_workers",
-    type=int,
-    default=None,
-    help="Number of worker processes for embedding-level parallelism per fold. If None, calculated automatically.",
-)
-parser.add_argument(
     "--max_k",
     type=int,
     default=40,
@@ -99,17 +72,6 @@ parser.add_argument(
 )
 args = parser.parse_args()
 
-# Set BLAS threading according to argument (done before any numpy imports)
-if args.blas_threads > 1:
-    print(f"Setting BLAS libraries to use {args.blas_threads} threads per process")
-    os.environ["OMP_NUM_THREADS"] = str(args.blas_threads)
-    os.environ["OPENBLAS_NUM_THREADS"] = str(args.blas_threads)
-    os.environ["MKL_NUM_THREADS"] = str(args.blas_threads)
-    os.environ["VECLIB_MAXIMUM_THREADS"] = str(args.blas_threads)
-    os.environ["NUMEXPR_NUM_THREADS"] = str(args.blas_threads)
-else:
-    print("Using single-threaded BLAS operations to maximize process parallelism")
-
 # Setup directory paths
 if args.ONLY_MAIN_LABEL:
     label_type = "main_labels_only"
@@ -121,48 +83,6 @@ output_dir = os.path.join(args.base_dir, f"cluster_metrics_{args.N}_{label_type}
 
 # Create output directory
 os.makedirs(output_dir, exist_ok=True)
-
-# Calculate optimal number of worker processes
-available_cpus = mp.cpu_count()
-
-# If on a very large system, cap the total CPU usage more aggressively
-if available_cpus > 64:
-    print(f"Large system detected with {available_cpus} CPUs")
-    effective_cpus = min(
-        args.max_total_processes, int(available_cpus * args.cpu_fraction)
-    )
-    print(f"Capping effective CPUs to {effective_cpus} to prevent OpenBLAS issues")
-else:
-    effective_cpus = int(available_cpus * args.cpu_fraction)
-
-# Set up hierarchical parallelism
-if args.fold_workers is None:
-    # For large systems, allocate CPUs intelligently between levels of parallelism
-    if effective_cpus >= 32:
-        fold_workers = min(
-            4, effective_cpus // 8
-        )  # Reduce from 8 to 4 for large systems
-    else:
-        fold_workers = max(1, effective_cpus // 4)  # At least one fold worker
-else:
-    fold_workers = args.fold_workers
-
-# Calculate how many CPUs to use per fold
-cpus_per_fold = max(1, effective_cpus // fold_workers)
-
-# Set embedding workers if not specified
-if args.embedding_workers is None:
-    embedding_workers = max(1, cpus_per_fold // 2)  # Leave some CPUs for KMeans
-else:
-    embedding_workers = args.embedding_workers
-
-print(f"Parallelization strategy:")
-print(f"  Total available CPUs: {available_cpus}")
-print(f"  Using {effective_cpus} CPUs ({args.cpu_fraction * 100:.0f}% of available)")
-print(f"  Processing {fold_workers} folds in parallel")
-print(f"  Using {embedding_workers} workers per fold for embedding parallelism")
-print(f"  Effective CPUs per fold: ~{cpus_per_fold}")
-print(f"  BLAS threads per process: {args.blas_threads}")
 
 # Define the range of k values
 k_values = range(args.min_k, args.max_k + 1, args.step_k)
@@ -177,7 +97,7 @@ def get_majority_labels(metadata):
             label for label in item["preds_0.4"] if label.isupper() and label != "MT"
         ]
         if main_labels:
-            # Take the first label as the majority class (since we already filtered in the sampling script)
+            # Take the first label as the majority class
             labels.append(main_labels[0])
         else:
             # If no valid labels, use a placeholder
@@ -186,7 +106,7 @@ def get_majority_labels(metadata):
 
 
 # Function to calculate metrics for a specific embedding and k value
-def calculate_metrics_for_k(data, true_labels, k, random_state):
+def calculate_metrics_for_k(data, true_labels, k, random_state, n_jobs):
     # Skip if number of samples is less than k
     if len(data) <= k:
         return {
@@ -201,8 +121,10 @@ def calculate_metrics_for_k(data, true_labels, k, random_state):
             "calinski_harabasz": None,
         }
 
-    # Fit KMeans
-    kmeans = KMeans(n_clusters=k, random_state=random_state, n_init="auto")
+    # Fit KMeans with specified n_jobs for parallelism
+    kmeans = KMeans(
+        n_clusters=k, random_state=random_state, n_init="auto", n_jobs=n_jobs
+    )
     cluster_labels = kmeans.fit_predict(data)
 
     # Calculate metrics
@@ -228,41 +150,8 @@ def calculate_metrics_for_k(data, true_labels, k, random_state):
     }
 
 
-# Process a single embedding for all k values using sub-processes
-def process_single_embedding(args):
-    embedding_name, embeddings, true_labels, k_values, random_state = args
-    results = []
-    for k in k_values:
-        metrics = calculate_metrics_for_k(embeddings, true_labels, k, random_state)
-        metrics["embedding"] = embedding_name
-        results.append(metrics)
-    return results
-
-
-# Function to process embeddings (UMAP or raw) in parallel
-def process_embeddings_parallel(embedding_tasks, k_values, random_state, num_workers):
-    # Prepare tasks
-    tasks = [
-        (name, emb, labels, k_values, random_state)
-        for name, emb, labels in embedding_tasks
-    ]
-
-    # Process in parallel using ProcessPoolExecutor
-    with ProcessPoolExecutor(max_workers=num_workers) as executor:
-        results = list(executor.map(process_single_embedding, tasks))
-
-    # Flatten results
-    all_results = []
-    for result_batch in results:
-        all_results.extend(result_batch)
-
-    return all_results
-
-
 # Function to process a single fold file
-def process_fold(
-    fold_file, input_dir, output_dir, k_values, random_state, embedding_workers
-):
+def process_fold(fold_file, input_dir, output_dir, k_values, random_state, kmeans_jobs):
     start_time = time.time()
     fold_name = os.path.basename(fold_file)
     fold_number = fold_name.split("_")[2].split(".")[0]
@@ -282,30 +171,45 @@ def process_fold(
     # Get majority labels
     true_labels = get_majority_labels(metadata)
 
-    # Prepare all embedding tasks
-    embedding_tasks = []
-    for position in ["first", "half", "last"]:
+    # Process each embedding type and k value
+    all_metrics = []
+
+    # Define all embedding positions and types we want to process
+    positions = ["first", "half", "last"]
+    embedding_types = ["raw"] + [f"umap_{dim}d" for dim in [2, 4, 8, 16, 32]]
+
+    total_embeddings = len(positions) * len(embedding_types)
+    print(
+        f"  Processing {total_embeddings} embedding types sequentially, using KMeans parallelism (n_jobs={kmeans_jobs})"
+    )
+
+    # Process each embedding type
+    for position in positions:
         position_embeddings = embeddings[position]
 
-        # Add raw embeddings
-        embedding_tasks.append(
-            (f"{position}_raw", position_embeddings["raw"], true_labels)
-        )
+        # Process raw embeddings
+        print(f"  Processing {position}_raw...")
+        for k in k_values:
+            metrics = calculate_metrics_for_k(
+                position_embeddings["raw"], true_labels, k, random_state, kmeans_jobs
+            )
+            metrics["embedding"] = f"{position}_raw"
+            all_metrics.append(metrics)
 
-        # Add UMAP projections
+        # Process UMAP projections
         for dim in [2, 4, 8, 16, 32]:
             umap_key = f"umap_{dim}d"
-            embedding_tasks.append(
-                (f"{position}_{umap_key}", position_embeddings[umap_key], true_labels)
-            )
-
-    # Process all embeddings in parallel
-    print(
-        f"  Starting parallel processing of {len(embedding_tasks)} embedding types with {embedding_workers} workers"
-    )
-    all_metrics = process_embeddings_parallel(
-        embedding_tasks, k_values, random_state, embedding_workers
-    )
+            print(f"  Processing {position}_{umap_key}...")
+            for k in k_values:
+                metrics = calculate_metrics_for_k(
+                    position_embeddings[umap_key],
+                    true_labels,
+                    k,
+                    random_state,
+                    kmeans_jobs,
+                )
+                metrics["embedding"] = f"{position}_{umap_key}"
+                all_metrics.append(metrics)
 
     # Save the results
     output_file = os.path.join(output_dir, f"metrics_fold_{fold_number}.pkl")
@@ -335,6 +239,8 @@ def main():
     print(f"Starting clustering metrics calculation...")
     print(f"Input directory: {input_dir}")
     print(f"Output directory: {output_dir}")
+    print(f"Using {args.max_workers} parallel workers for folds")
+    print(f"Using {args.kmeans_jobs} cores for KMeans")
 
     # Check if input directory exists
     if not os.path.exists(input_dir):
@@ -365,15 +271,17 @@ def main():
         output_dir=output_dir,
         k_values=k_values,
         random_state=args.random_state,
-        embedding_workers=embedding_workers,
+        kmeans_jobs=args.kmeans_jobs,
     )
 
-    # Process folds in parallel if fold_workers > 1, otherwise sequentially
-    if fold_workers > 1:
-        print(
-            f"Using {fold_workers} worker processes for fold-level parallel processing"
-        )
-        with ProcessPoolExecutor(max_workers=fold_workers) as executor:
+    # Process folds in parallel
+    num_workers = min(
+        args.max_workers, len(fold_files)
+    )  # Don't use more workers than files
+    print(f"Processing folds with {num_workers} parallel workers")
+
+    if num_workers > 1:
+        with ProcessPoolExecutor(max_workers=num_workers) as executor:
             # Using list() to ensure we wait for all tasks to complete
             results = list(executor.map(process_fold_partial, fold_files))
     else:
