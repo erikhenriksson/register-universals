@@ -3,8 +3,16 @@ import multiprocessing as mp
 import os
 import pickle
 import time
+import warnings
 from concurrent.futures import ProcessPoolExecutor
 from functools import partial
+
+# Control OpenBLAS thread usage to prevent thread explosion
+os.environ["OMP_NUM_THREADS"] = "1"  # OpenMP threads
+os.environ["OPENBLAS_NUM_THREADS"] = "1"  # OpenBLAS threads
+os.environ["MKL_NUM_THREADS"] = "1"  # MKL threads
+os.environ["VECLIB_MAXIMUM_THREADS"] = "1"  # Accelerate threads
+os.environ["NUMEXPR_NUM_THREADS"] = "1"  # Numexpr threads
 
 import numpy as np
 from sklearn.cluster import KMeans
@@ -20,15 +28,18 @@ from sklearn.metrics import (
 )
 from tqdm import tqdm
 
-# Parse command line arguments
-parser = argparse.ArgumentParser(
-    description="Calculate clustering metrics on UMAP projections."
+# Add OpenBLAS control parameters
+parser.add_argument(
+    "--blas_threads",
+    type=int,
+    default=1,
+    help="Number of threads for BLAS operations per process. Default is 1 to prevent thread explosion.",
 )
 parser.add_argument(
-    "--N",
+    "--max_total_processes",
     type=int,
-    default=1000,
-    help="Number of samples per label per language (used for directory naming).",
+    default=64,
+    help="Maximum total number of processes to use, to prevent OpenBLAS errors on large systems.",
 )
 parser.add_argument(
     "--ONLY_MAIN_LABEL",
@@ -79,6 +90,17 @@ parser.add_argument(
 )
 args = parser.parse_args()
 
+# Set BLAS threading according to argument (done before any numpy imports)
+if args.blas_threads > 1:
+    print(f"Setting BLAS libraries to use {args.blas_threads} threads per process")
+    os.environ["OMP_NUM_THREADS"] = str(args.blas_threads)
+    os.environ["OPENBLAS_NUM_THREADS"] = str(args.blas_threads)
+    os.environ["MKL_NUM_THREADS"] = str(args.blas_threads)
+    os.environ["VECLIB_MAXIMUM_THREADS"] = str(args.blas_threads)
+    os.environ["NUMEXPR_NUM_THREADS"] = str(args.blas_threads)
+else:
+    print("Using single-threaded BLAS operations to maximize process parallelism")
+
 # Setup directory paths
 if args.ONLY_MAIN_LABEL:
     label_type = "main_labels_only"
@@ -94,10 +116,13 @@ os.makedirs(output_dir, exist_ok=True)
 # Calculate optimal number of worker processes
 available_cpus = mp.cpu_count()
 
-# If on a very large system, cap the total CPU usage
+# If on a very large system, cap the total CPU usage more aggressively
 if available_cpus > 64:
     print(f"Large system detected with {available_cpus} CPUs")
-    effective_cpus = int(available_cpus * args.cpu_fraction)
+    effective_cpus = min(
+        args.max_total_processes, int(available_cpus * args.cpu_fraction)
+    )
+    print(f"Capping effective CPUs to {effective_cpus} to prevent OpenBLAS issues")
 else:
     effective_cpus = int(available_cpus * args.cpu_fraction)
 
@@ -105,7 +130,9 @@ else:
 if args.fold_workers is None:
     # For large systems, allocate CPUs intelligently between levels of parallelism
     if effective_cpus >= 32:
-        fold_workers = min(8, effective_cpus // 8)  # Cap at 8 folds in parallel
+        fold_workers = min(
+            4, effective_cpus // 8
+        )  # Reduce from 8 to 4 for large systems
     else:
         fold_workers = max(1, effective_cpus // 4)  # At least one fold worker
 else:
