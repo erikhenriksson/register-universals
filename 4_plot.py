@@ -492,8 +492,10 @@ def plot_umap_scatter(umap_dir, all_data=None):
                         bbox_to_anchor=(1.05, 1),
                         fontsize=10,
                     )
-                    # Increase marker size in legend
-                    for handle in legend.legendHandles:
+                    # Increase marker size in legend - FIXED VERSION
+                    for handle in (
+                        legend.legendHandles if hasattr(legend, "legendHandles") else []
+                    ):
                         handle.set_sizes([50])  # Increase dot size in legend
                 else:
                     # Create a more compact legend for many labels
@@ -504,8 +506,10 @@ def plot_umap_scatter(umap_dir, all_data=None):
                         fontsize=8,
                         ncol=2,
                     )
-                    # Increase marker size in legend
-                    for handle in legend.legendHandles:
+                    # Increase marker size in legend - FIXED VERSION
+                    for handle in (
+                        legend.legendHandles if hasattr(legend, "legendHandles") else []
+                    ):
                         handle.set_sizes([40])  # Increase dot size in legend
 
                 plt.tight_layout()
@@ -567,10 +571,12 @@ def plot_umap_scatter(umap_dir, all_data=None):
                 plt.xlabel("UMAP Dimension 1")
                 plt.ylabel("UMAP Dimension 2")
 
-                # Add legend with larger dots
+                # Add legend with larger dots - FIXED VERSION
                 legend = plt.legend(title="Language", loc="best")
-                # Increase marker size in legend
-                for handle in legend.legendHandles:
+                # Increase marker size in legend - FIXED VERSION
+                for handle in (
+                    legend.legendHandles if hasattr(legend, "legendHandles") else []
+                ):
                     handle.set_sizes([50])  # Increase dot size in legend
 
                 plt.tight_layout()
@@ -641,14 +647,18 @@ def plot_umap_scatter(umap_dir, all_data=None):
                             plt.xlabel("UMAP Dimension 1")
                             plt.ylabel("UMAP Dimension 2")
 
-                            # Add legend with larger markers
+                            # Add legend with larger markers - FIXED VERSION
                             legend = plt.legend(
                                 title=f"K-means Clusters (k={k})",
                                 loc="best",
                                 bbox_to_anchor=(1.05, 1),
                             )
-                            # Increase marker size in legend
-                            for handle in legend.legendHandles:
+                            # Increase marker size in legend - FIXED VERSION
+                            for handle in (
+                                legend.legendHandles
+                                if hasattr(legend, "legendHandles")
+                                else []
+                            ):
                                 handle.set_sizes([50])  # Increase dot size in legend
 
                             plt.tight_layout()
