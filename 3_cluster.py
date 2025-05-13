@@ -3,6 +3,7 @@ import multiprocessing as mp
 import os
 import pickle
 import time
+from concurrent.futures import ProcessPoolExecutor
 from functools import partial
 
 import numpy as np
@@ -53,6 +54,18 @@ parser.add_argument(
     help="Fraction of CPUs to use for parallel processing (0.0-1.0).",
 )
 parser.add_argument(
+    "--fold_workers",
+    type=int,
+    default=None,
+    help="Number of worker processes for fold-level parallelism. If None, calculated automatically.",
+)
+parser.add_argument(
+    "--embedding_workers",
+    type=int,
+    default=None,
+    help="Number of worker processes for embedding-level parallelism per fold. If None, calculated automatically.",
+)
+parser.add_argument(
     "--max_k",
     type=int,
     default=40,
@@ -78,12 +91,41 @@ output_dir = os.path.join(args.base_dir, f"cluster_metrics_{args.N}_{label_type}
 # Create output directory
 os.makedirs(output_dir, exist_ok=True)
 
-# Automatically determine number of worker processes
+# Calculate optimal number of worker processes
 available_cpus = mp.cpu_count()
-num_workers = max(1, int(available_cpus * args.cpu_fraction))
-print(
-    f"Detected {available_cpus} CPUs, using {num_workers} worker processes ({args.cpu_fraction * 100:.0f}%)"
-)
+
+# If on a very large system, cap the total CPU usage
+if available_cpus > 64:
+    print(f"Large system detected with {available_cpus} CPUs")
+    effective_cpus = int(available_cpus * args.cpu_fraction)
+else:
+    effective_cpus = int(available_cpus * args.cpu_fraction)
+
+# Set up hierarchical parallelism
+if args.fold_workers is None:
+    # For large systems, allocate CPUs intelligently between levels of parallelism
+    if effective_cpus >= 32:
+        fold_workers = min(8, effective_cpus // 8)  # Cap at 8 folds in parallel
+    else:
+        fold_workers = max(1, effective_cpus // 4)  # At least one fold worker
+else:
+    fold_workers = args.fold_workers
+
+# Calculate how many CPUs to use per fold
+cpus_per_fold = max(1, effective_cpus // fold_workers)
+
+# Set embedding workers if not specified
+if args.embedding_workers is None:
+    embedding_workers = max(1, cpus_per_fold // 2)  # Leave some CPUs for KMeans
+else:
+    embedding_workers = args.embedding_workers
+
+print(f"Parallelization strategy:")
+print(f"  Total available CPUs: {available_cpus}")
+print(f"  Using {effective_cpus} CPUs ({args.cpu_fraction * 100:.0f}% of available)")
+print(f"  Processing {fold_workers} folds in parallel")
+print(f"  Using {embedding_workers} workers per fold for embedding parallelism")
+print(f"  Effective CPUs per fold: ~{cpus_per_fold}")
 
 # Define the range of k values
 k_values = range(args.min_k, args.max_k + 1, args.step_k)
@@ -127,21 +169,13 @@ def calculate_metrics_for_k(data, true_labels, k, random_state):
     cluster_labels = kmeans.fit_predict(data)
 
     # Calculate metrics
-
     sil_score = silhouette_score(data, cluster_labels)
-
     ari_score = adjusted_rand_score(true_labels, cluster_labels)
-
     nmi_score = normalized_mutual_info_score(true_labels, cluster_labels)
-
     v_score = v_measure_score(true_labels, cluster_labels)
-
     homo_score = homogeneity_score(true_labels, cluster_labels)
-
     comp_score = completeness_score(true_labels, cluster_labels)
-
     db_score = davies_bouldin_score(data, cluster_labels)
-
     ch_score = calinski_harabasz_score(data, cluster_labels)
 
     return {
@@ -157,20 +191,41 @@ def calculate_metrics_for_k(data, true_labels, k, random_state):
     }
 
 
-# Function to process embeddings (UMAP or raw)
-def process_embeddings(embedding_name, embeddings, true_labels, k_values, random_state):
+# Process a single embedding for all k values using sub-processes
+def process_single_embedding(args):
+    embedding_name, embeddings, true_labels, k_values, random_state = args
     results = []
-
     for k in k_values:
         metrics = calculate_metrics_for_k(embeddings, true_labels, k, random_state)
         metrics["embedding"] = embedding_name
         results.append(metrics)
-
     return results
 
 
+# Function to process embeddings (UMAP or raw) in parallel
+def process_embeddings_parallel(embedding_tasks, k_values, random_state, num_workers):
+    # Prepare tasks
+    tasks = [
+        (name, emb, labels, k_values, random_state)
+        for name, emb, labels in embedding_tasks
+    ]
+
+    # Process in parallel using ProcessPoolExecutor
+    with ProcessPoolExecutor(max_workers=num_workers) as executor:
+        results = list(executor.map(process_single_embedding, tasks))
+
+    # Flatten results
+    all_results = []
+    for result_batch in results:
+        all_results.extend(result_batch)
+
+    return all_results
+
+
 # Function to process a single fold file
-def process_fold(fold_file, input_dir, output_dir, k_values, random_state):
+def process_fold(
+    fold_file, input_dir, output_dir, k_values, random_state, embedding_workers
+):
     start_time = time.time()
     fold_name = os.path.basename(fold_file)
     fold_number = fold_name.split("_")[2].split(".")[0]
@@ -190,36 +245,30 @@ def process_fold(fold_file, input_dir, output_dir, k_values, random_state):
     # Get majority labels
     true_labels = get_majority_labels(metadata)
 
-    # Store all metrics
-    all_metrics = []
-
-    # Process each embedding type
+    # Prepare all embedding tasks
+    embedding_tasks = []
     for position in ["first", "half", "last"]:
         position_embeddings = embeddings[position]
 
-        # Process raw embeddings
-        print(f"  Processing raw {position} embeddings...")
-        raw_results = process_embeddings(
-            f"{position}_raw",
-            position_embeddings["raw"],
-            true_labels,
-            k_values,
-            random_state,
+        # Add raw embeddings
+        embedding_tasks.append(
+            (f"{position}_raw", position_embeddings["raw"], true_labels)
         )
-        all_metrics.extend(raw_results)
 
-        # Process UMAP projections
+        # Add UMAP projections
         for dim in [2, 4, 8, 16, 32]:
             umap_key = f"umap_{dim}d"
-            print(f"  Processing {position} {umap_key}...")
-            umap_results = process_embeddings(
-                f"{position}_{umap_key}",
-                position_embeddings[umap_key],
-                true_labels,
-                k_values,
-                random_state,
+            embedding_tasks.append(
+                (f"{position}_{umap_key}", position_embeddings[umap_key], true_labels)
             )
-            all_metrics.extend(umap_results)
+
+    # Process all embeddings in parallel
+    print(
+        f"  Starting parallel processing of {len(embedding_tasks)} embedding types with {embedding_workers} workers"
+    )
+    all_metrics = process_embeddings_parallel(
+        embedding_tasks, k_values, random_state, embedding_workers
+    )
 
     # Save the results
     output_file = os.path.join(output_dir, f"metrics_fold_{fold_number}.pkl")
@@ -279,21 +328,19 @@ def main():
         output_dir=output_dir,
         k_values=k_values,
         random_state=args.random_state,
+        embedding_workers=embedding_workers,
     )
 
-    # Process folds in parallel if num_workers > 1, otherwise sequentially
-    if num_workers > 1:
-        print(f"Using {num_workers} worker processes for parallel processing")
-        with mp.Pool(processes=num_workers) as pool:
-            results = []
-            for result in tqdm(
-                pool.imap_unordered(process_fold_partial, fold_files),
-                total=len(fold_files),
-                desc="Processing folds",
-            ):
-                results.append(result)
+    # Process folds in parallel if fold_workers > 1, otherwise sequentially
+    if fold_workers > 1:
+        print(
+            f"Using {fold_workers} worker processes for fold-level parallel processing"
+        )
+        with ProcessPoolExecutor(max_workers=fold_workers) as executor:
+            # Using list() to ensure we wait for all tasks to complete
+            results = list(executor.map(process_fold_partial, fold_files))
     else:
-        print("Processing sequentially (no multiprocessing)")
+        print("Processing folds sequentially")
         results = []
         for fold_file in tqdm(fold_files, desc="Processing folds"):
             results.append(process_fold_partial(fold_file))
@@ -306,7 +353,7 @@ def main():
 
     # Print summary
     print("\nProcessing summary:")
-    for fold_number, summary in sorted(results):
+    for fold_number, summary in sorted(results, key=lambda x: x[0]):
         print(
             f"  Fold {fold_number}: {summary['num_samples']} samples, {summary['unique_labels']} unique labels"
         )
