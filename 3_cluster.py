@@ -41,7 +41,7 @@ parser.add_argument(
 parser.add_argument(
     "--max_total_processes",
     type=int,
-    default=64,
+    default=128,
     help="Maximum total number of processes to use, to prevent OpenBLAS errors on large systems.",
 )
 parser.add_argument(
