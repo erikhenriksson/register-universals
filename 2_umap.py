@@ -4,7 +4,15 @@ import os
 import pickle
 import time
 import warnings
+from concurrent.futures import ProcessPoolExecutor
 from functools import partial
+
+# Control OpenBLAS thread usage to prevent thread explosion
+os.environ["OMP_NUM_THREADS"] = "1"  # OpenMP threads
+os.environ["OPENBLAS_NUM_THREADS"] = "1"  # OpenBLAS threads
+os.environ["MKL_NUM_THREADS"] = "1"  # MKL threads
+os.environ["VECLIB_MAXIMUM_THREADS"] = "1"  # Accelerate threads
+os.environ["NUMEXPR_NUM_THREADS"] = "1"  # Numexpr threads
 
 import numpy as np
 import umap
@@ -52,7 +60,42 @@ parser.add_argument(
     default=0.9,
     help="Fraction of CPUs to use for parallel processing (0.0-1.0).",
 )
+parser.add_argument(
+    "--fold_workers",
+    type=int,
+    default=None,
+    help="Number of worker processes for fold-level parallelism. If None, calculated automatically.",
+)
+parser.add_argument(
+    "--embedding_workers",
+    type=int,
+    default=None,
+    help="Number of worker processes for embedding-level parallelism per fold. If None, calculated automatically.",
+)
+parser.add_argument(
+    "--blas_threads",
+    type=int,
+    default=1,
+    help="Number of threads for BLAS operations per process. Default is 1 to prevent thread explosion.",
+)
+parser.add_argument(
+    "--max_total_processes",
+    type=int,
+    default=64,
+    help="Maximum total number of processes to use, to prevent OpenBLAS errors on large systems.",
+)
 args = parser.parse_args()
+
+# Set BLAS threading according to argument
+if args.blas_threads > 1:
+    print(f"Setting BLAS libraries to use {args.blas_threads} threads per process")
+    os.environ["OMP_NUM_THREADS"] = str(args.blas_threads)
+    os.environ["OPENBLAS_NUM_THREADS"] = str(args.blas_threads)
+    os.environ["MKL_NUM_THREADS"] = str(args.blas_threads)
+    os.environ["VECLIB_MAXIMUM_THREADS"] = str(args.blas_threads)
+    os.environ["NUMEXPR_NUM_THREADS"] = str(args.blas_threads)
+else:
+    print("Using single-threaded BLAS operations to maximize process parallelism")
 
 # Setup directory paths
 if args.ONLY_MAIN_LABEL:
@@ -66,19 +109,93 @@ output_dir = os.path.join(args.base_dir, f"umap_data_{args.N}_{label_type}")
 # Create output directory
 os.makedirs(output_dir, exist_ok=True)
 
-# Automatically determine number of worker processes
+# Calculate optimal number of worker processes
 available_cpus = mp.cpu_count()
-num_workers = max(1, int(available_cpus * args.cpu_fraction))
-print(
-    f"Detected {available_cpus} CPUs, using {num_workers} worker processes ({args.cpu_fraction * 100:.0f}%)"
-)
+
+# If on a very large system, cap the total CPU usage more aggressively
+if available_cpus > 64:
+    print(f"Large system detected with {available_cpus} CPUs")
+    effective_cpus = min(
+        args.max_total_processes, int(available_cpus * args.cpu_fraction)
+    )
+    print(f"Capping effective CPUs to {effective_cpus} to prevent OpenBLAS issues")
+else:
+    effective_cpus = int(available_cpus * args.cpu_fraction)
+
+# Set up hierarchical parallelism
+if args.fold_workers is None:
+    # For large systems, allocate CPUs intelligently between levels of parallelism
+    if effective_cpus >= 32:
+        fold_workers = min(
+            4, effective_cpus // 8
+        )  # Reduce from 8 to 4 for large systems
+    else:
+        fold_workers = max(1, effective_cpus // 4)  # At least one fold worker
+else:
+    fold_workers = args.fold_workers
+
+# Calculate how many CPUs to use per fold
+cpus_per_fold = max(1, effective_cpus // fold_workers)
+
+# Set embedding workers if not specified
+if args.embedding_workers is None:
+    embedding_workers = max(1, cpus_per_fold // 2)  # Leave some CPUs for UMAP
+else:
+    embedding_workers = args.embedding_workers
+
+print(f"Parallelization strategy:")
+print(f"  Total available CPUs: {available_cpus}")
+print(f"  Using {effective_cpus} CPUs ({args.cpu_fraction * 100:.0f}% of available)")
+print(f"  Processing {fold_workers} folds in parallel")
+print(f"  Using {embedding_workers} workers per fold for embedding parallelism")
+print(f"  Effective CPUs per fold: ~{cpus_per_fold}")
+print(f"  BLAS threads per process: {args.blas_threads}")
 
 # UMAP dimensions to generate
 umap_dimensions = [2, 4, 8, 16, 32]
 
 
+# Function to process a single embedding-dimension combination
+def process_umap_embedding(args):
+    embedding, dim, umap_params = args
+    try:
+        umap_model = umap.UMAP(n_components=dim, **umap_params)
+        result = umap_model.fit_transform(embedding)
+        return dim, result
+    except Exception as e:
+        print(f"Error processing {dim}D UMAP: {str(e)}")
+        return dim, None
+
+
+# Process a single position's embeddings (first, half, last) with parallel UMAP
+def process_position_embeddings(
+    position_name, embeddings, umap_dimensions, umap_params, num_workers
+):
+    print(
+        f"  Processing {position_name} token embeddings with {num_workers} workers..."
+    )
+
+    # Prepare tasks for parallel execution
+    tasks = [(embeddings, dim, umap_params) for dim in umap_dimensions]
+
+    results = {"raw": embeddings}
+
+    # Run UMAP in parallel for different dimensions
+    with ProcessPoolExecutor(max_workers=num_workers) as executor:
+        for dim, result in executor.map(process_umap_embedding, tasks):
+            if result is not None:
+                results[f"umap_{dim}d"] = result
+                print(
+                    f"    Completed {dim}D UMAP projection for {position_name} tokens"
+                )
+
+    return results
+
+
 # Function to process a single fold file
-def process_fold(fold_file, input_dir, output_dir, umap_dimensions, umap_params):
+def process_fold(
+    fold_file, input_dir, output_dir, umap_dimensions, umap_params, embedding_workers
+):
     start_time = time.time()
     fold_name = os.path.basename(fold_file)
     fold_number = fold_name.split("_")[1].split(".")[0]
@@ -103,35 +220,22 @@ def process_fold(fold_file, input_dir, output_dir, umap_dimensions, umap_params)
         for item in fold_data
     ]
 
-    # Process each embedding type
+    # Process each embedding type in parallel
     results = {}
 
-    # Process first token embeddings
-    print(f"  Processing first token embeddings...")
-    first_results = {"raw": embeds_first}
-    for dim in umap_dimensions:
-        print(f"    Generating {dim}D UMAP projection...")
-        umap_model = umap.UMAP(n_components=dim, **umap_params)
-        first_results[f"umap_{dim}d"] = umap_model.fit_transform(embeds_first)
-    results["first"] = first_results
+    # Process all three positions (first, half, last) sequentially
+    # Each position will process its different UMAP dimensions in parallel
+    results["first"] = process_position_embeddings(
+        "first", embeds_first, umap_dimensions, umap_params, embedding_workers
+    )
 
-    # Process middle token embeddings
-    print(f"  Processing middle token embeddings...")
-    half_results = {"raw": embeds_half}
-    for dim in umap_dimensions:
-        print(f"    Generating {dim}D UMAP projection...")
-        umap_model = umap.UMAP(n_components=dim, **umap_params)
-        half_results[f"umap_{dim}d"] = umap_model.fit_transform(embeds_half)
-    results["half"] = half_results
+    results["half"] = process_position_embeddings(
+        "half", embeds_half, umap_dimensions, umap_params, embedding_workers
+    )
 
-    # Process last token embeddings
-    print(f"  Processing last token embeddings...")
-    last_results = {"raw": embeds_last}
-    for dim in umap_dimensions:
-        print(f"    Generating {dim}D UMAP projection...")
-        umap_model = umap.UMAP(n_components=dim, **umap_params)
-        last_results[f"umap_{dim}d"] = umap_model.fit_transform(embeds_last)
-    results["last"] = last_results
+    results["last"] = process_position_embeddings(
+        "last", embeds_last, umap_dimensions, umap_params, embedding_workers
+    )
 
     # Create final results dictionary with metadata
     fold_results = {"metadata": metadata, "embeddings": results}
@@ -187,28 +291,26 @@ def main():
         output_dir=output_dir,
         umap_dimensions=umap_dimensions,
         umap_params=umap_params,
+        embedding_workers=embedding_workers,
     )
 
-    # Process folds in parallel if num_workers > 1, otherwise sequentially
-    if num_workers > 1:
-        print(f"Using {num_workers} worker processes for parallel processing")
-        with mp.Pool(processes=num_workers) as pool:
-            results = []
-            for result in tqdm(
-                pool.imap_unordered(process_fold_partial, fold_files),
-                total=len(fold_files),
-                desc="Processing folds",
-            ):
-                results.append(result)
+    # Process folds in parallel if fold_workers > 1, otherwise sequentially
+    if fold_workers > 1:
+        print(
+            f"Using {fold_workers} worker processes for fold-level parallel processing"
+        )
+        with ProcessPoolExecutor(max_workers=fold_workers) as executor:
+            # Using list() to ensure we wait for all tasks to complete
+            results = list(executor.map(process_fold_partial, fold_files))
     else:
-        print("Processing sequentially (no multiprocessing)")
+        print("Processing folds sequentially")
         results = []
         for fold_file in tqdm(fold_files, desc="Processing folds"):
             results.append(process_fold_partial(fold_file))
 
     # Print summary
     print("\nProcessing summary:")
-    for fold_number, count in sorted(results):
+    for fold_number, count in sorted(results, key=lambda x: x[0]):
         print(f"  Fold {fold_number}: {count} samples processed")
 
     print(f"\nUMAP projections generation complete. Results saved to {output_dir}/")
