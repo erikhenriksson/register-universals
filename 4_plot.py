@@ -814,7 +814,7 @@ def plot_2d_projections(dimred_dir, all_data=None):
                                         c=[cmap_clusters(cluster_id)],
                                         label=f"Cluster {cluster_id}",
                                         alpha=0.7,
-                                        s=5,
+                                        s=3,
                                         edgecolors="none",
                                     )
                                 plt.title(
