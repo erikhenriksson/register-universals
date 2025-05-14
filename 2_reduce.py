@@ -16,6 +16,7 @@ os.environ["NUMEXPR_NUM_THREADS"] = "1"  # Numexpr threads
 
 import numpy as np
 import umap
+from sklearn.decomposition import PCA
 from tqdm import tqdm
 
 # Suppress specific UMAP warnings
@@ -23,7 +24,7 @@ warnings.filterwarnings("ignore", category=UserWarning, module="umap")
 
 # Parse command line arguments
 parser = argparse.ArgumentParser(
-    description="Generate UMAP projections from embeddings."
+    description="Generate UMAP and PCA projections from embeddings."
 )
 parser.add_argument(
     "--N",
@@ -40,7 +41,7 @@ parser.add_argument(
     "--random_state",
     type=int,
     default=42,
-    help="Random state for UMAP for reproducibility.",
+    help="Random state for UMAP and PCA for reproducibility.",
 )
 parser.add_argument(
     "--n_neighbors", type=int, default=50, help="n_neighbors parameter for UMAP."
@@ -104,7 +105,9 @@ else:
     label_type = "filtered_labels"
 
 input_dir = os.path.join(args.base_dir, f"sampled_data_{args.N}_{label_type}")
-output_dir = os.path.join(args.base_dir, f"umap_data_{args.N}_{label_type}")
+output_dir = os.path.join(
+    args.base_dir, f"dimensionality_reduction_{args.N}_{label_type}"
+)
 
 # Create output directory
 os.makedirs(output_dir, exist_ok=True)
@@ -139,7 +142,7 @@ cpus_per_fold = max(1, effective_cpus // fold_workers)
 
 # Set embedding workers if not specified
 if args.embedding_workers is None:
-    embedding_workers = max(1, cpus_per_fold // 2)  # Leave some CPUs for UMAP
+    embedding_workers = max(1, cpus_per_fold // 2)  # Leave some CPUs for UMAP/PCA
 else:
     embedding_workers = args.embedding_workers
 
@@ -151,11 +154,40 @@ print(f"  Using {embedding_workers} workers per fold for embedding parallelism")
 print(f"  Effective CPUs per fold: ~{cpus_per_fold}")
 print(f"  BLAS threads per process: {args.blas_threads}")
 
-# UMAP dimensions to generate
+# Dimensionality reduction configurations
 umap_dimensions = [2, 4, 8, 16, 32]
+pca_dimensions = [2, 4, 8, 16]
+pca_umap_dimension = 2  # UMAP dimension to apply on PCA results
 
 
-# Function to process a single embedding-dimension combination
+# Function to process a single PCA embedding-dimension combination
+def process_pca_embedding(args):
+    embedding, dim, random_state = args
+    try:
+        pca_model = PCA(n_components=dim, random_state=random_state)
+        result = pca_model.fit_transform(embedding)
+        explained_variance = pca_model.explained_variance_ratio_.sum()
+        return dim, result, explained_variance
+    except Exception as e:
+        print(f"Error processing {dim}D PCA: {str(e)}")
+        return dim, None, 0.0
+
+
+# Function to process UMAP on a PCA-reduced embedding
+def process_pca_umap_embedding(args):
+    pca_embedding, dim, umap_params = args
+    try:
+        umap_model = umap.UMAP(
+            n_components=2, **umap_params
+        )  # Always use 2D for PCA+UMAP
+        result = umap_model.fit_transform(pca_embedding)
+        return dim, result
+    except Exception as e:
+        print(f"Error processing UMAP on {dim}D PCA: {str(e)}")
+        return dim, None
+
+
+# Function to process a single UMAP embedding-dimension combination
 def process_umap_embedding(args):
     embedding, dim, umap_params = args
     try:
@@ -167,22 +199,62 @@ def process_umap_embedding(args):
         return dim, None
 
 
-# Process a single position's embeddings (first, half, last) with parallel UMAP
+# Process a single position's embeddings with parallel PCA, UMAP, and PCA+UMAP
 def process_position_embeddings(
-    position_name, embeddings, umap_dimensions, umap_params, num_workers
+    position_name,
+    embeddings,
+    umap_dimensions,
+    pca_dimensions,
+    umap_params,
+    random_state,
+    num_workers,
 ):
     print(
         f"  Processing {position_name} token embeddings with {num_workers} workers..."
     )
 
-    # Prepare tasks for parallel execution
-    tasks = [(embeddings, dim, umap_params) for dim in umap_dimensions]
-
     results = {"raw": embeddings}
+
+    # 1. Prepare PCA tasks for parallel execution
+    pca_tasks = [(embeddings, dim, random_state) for dim in pca_dimensions]
+
+    pca_results = {}
+
+    # Run PCA in parallel for different dimensions
+    with ProcessPoolExecutor(max_workers=num_workers) as executor:
+        for dim, result, explained_variance in executor.map(
+            process_pca_embedding, pca_tasks
+        ):
+            if result is not None:
+                pca_results[dim] = result
+                results[f"pca_{dim}d"] = result
+                print(
+                    f"    Completed {dim}D PCA projection for {position_name} tokens "
+                    f"(explained variance: {explained_variance:.2%})"
+                )
+
+    # 2. Prepare PCA+UMAP tasks
+    pca_umap_tasks = [
+        (pca_results[dim], dim, umap_params)
+        for dim in pca_dimensions
+        if dim in pca_results
+    ]
+
+    # Run UMAP on PCA results
+    with ProcessPoolExecutor(max_workers=num_workers) as executor:
+        for dim, result in executor.map(process_pca_umap_embedding, pca_umap_tasks):
+            if result is not None:
+                results[f"pca_{dim}d_umap_2d"] = result
+                print(
+                    f"    Completed 2D UMAP on {dim}D PCA projection for {position_name} tokens"
+                )
+
+    # 3. Prepare UMAP tasks for parallel execution
+    umap_tasks = [(embeddings, dim, umap_params) for dim in umap_dimensions]
 
     # Run UMAP in parallel for different dimensions
     with ProcessPoolExecutor(max_workers=num_workers) as executor:
-        for dim, result in executor.map(process_umap_embedding, tasks):
+        for dim, result in executor.map(process_umap_embedding, umap_tasks):
             if result is not None:
                 results[f"umap_{dim}d"] = result
                 print(
@@ -194,7 +266,14 @@ def process_position_embeddings(
 
 # Function to process a single fold file
 def process_fold(
-    fold_file, input_dir, output_dir, umap_dimensions, umap_params, embedding_workers
+    fold_file,
+    input_dir,
+    output_dir,
+    umap_dimensions,
+    pca_dimensions,
+    umap_params,
+    random_state,
+    embedding_workers,
 ):
     start_time = time.time()
     fold_name = os.path.basename(fold_file)
@@ -224,24 +303,42 @@ def process_fold(
     results = {}
 
     # Process all three positions (first, half, last) sequentially
-    # Each position will process its different UMAP dimensions in parallel
+    # Each position will process its different PCA/UMAP dimensions in parallel
     results["first"] = process_position_embeddings(
-        "first", embeds_first, umap_dimensions, umap_params, embedding_workers
+        "first",
+        embeds_first,
+        umap_dimensions,
+        pca_dimensions,
+        umap_params,
+        random_state,
+        embedding_workers,
     )
 
     results["half"] = process_position_embeddings(
-        "half", embeds_half, umap_dimensions, umap_params, embedding_workers
+        "half",
+        embeds_half,
+        umap_dimensions,
+        pca_dimensions,
+        umap_params,
+        random_state,
+        embedding_workers,
     )
 
     results["last"] = process_position_embeddings(
-        "last", embeds_last, umap_dimensions, umap_params, embedding_workers
+        "last",
+        embeds_last,
+        umap_dimensions,
+        pca_dimensions,
+        umap_params,
+        random_state,
+        embedding_workers,
     )
 
     # Create final results dictionary with metadata
     fold_results = {"metadata": metadata, "embeddings": results}
 
     # Save the results
-    output_file = os.path.join(output_dir, f"umap_fold_{fold_number}.pkl")
+    output_file = os.path.join(output_dir, f"dim_reduction_fold_{fold_number}.pkl")
     with open(output_file, "wb") as f:
         pickle.dump(fold_results, f)
 
@@ -255,7 +352,7 @@ def process_fold(
 
 # Main execution
 def main():
-    print("Starting UMAP projections generation...")
+    print("Starting dimensionality reduction projections generation...")
     print(f"Input directory: {input_dir}")
     print(f"Output directory: {output_dir}")
 
@@ -290,7 +387,9 @@ def main():
         input_dir=input_dir,
         output_dir=output_dir,
         umap_dimensions=umap_dimensions,
+        pca_dimensions=pca_dimensions,
         umap_params=umap_params,
+        random_state=args.random_state,
         embedding_workers=embedding_workers,
     )
 
@@ -313,7 +412,12 @@ def main():
     for fold_number, count in sorted(results, key=lambda x: x[0]):
         print(f"  Fold {fold_number}: {count} samples processed")
 
-    print(f"\nUMAP projections generation complete. Results saved to {output_dir}/")
+    print("\nDimensionality reduction summary:")
+    print("  PCA dimensions: ", pca_dimensions)
+    print("  UMAP dimensions: ", umap_dimensions)
+    print("  PCA+UMAP: PCA dimensions", pca_dimensions, "followed by 2D UMAP")
+
+    print(f"\nAll dimensionality reductions complete. Results saved to {output_dir}/")
 
 
 if __name__ == "__main__":
