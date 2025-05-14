@@ -98,6 +98,11 @@ parser.add_argument(
     default=[4, 8, 25],
     help="K values to use for k-means cluster visualization (default: [4, 8, 25]).",
 )
+parser.add_argument(
+    "--debug",
+    action="store_true",
+    help="Enable debug printing for diagnosing issues.",
+)
 args = parser.parse_args()
 
 # Setup directory paths
@@ -317,7 +322,7 @@ def plot_metric(metric, processed_data):
                 valid_k,
                 valid_lower,
                 valid_upper,
-                alpha=0.2,
+                alpha=0.1,
                 color=embedding_colors[embed_type],
             )
 
@@ -483,7 +488,7 @@ def plot_umap_scatter(umap_dir, all_data=None):
                 plt.xlabel("UMAP Dimension 1")
                 plt.ylabel("UMAP Dimension 2")
 
-                # Add legend with reasonable size and position - with BIGGER marker sizes
+                # Add legend with reasonable size and position - FIXED
                 if num_labels <= 20:
                     # Full legend for manageable number of labels
                     legend = plt.legend(
@@ -491,12 +496,8 @@ def plot_umap_scatter(umap_dir, all_data=None):
                         loc="best",
                         bbox_to_anchor=(1.05, 1),
                         fontsize=10,
+                        markerscale=10,  # Scale marker size in legend
                     )
-                    # Increase marker size in legend - FIXED VERSION
-                    for handle in (
-                        legend.legendHandles if hasattr(legend, "legendHandles") else []
-                    ):
-                        handle.set_sizes([50])  # Increase dot size in legend
                 else:
                     # Create a more compact legend for many labels
                     legend = plt.legend(
@@ -505,12 +506,8 @@ def plot_umap_scatter(umap_dir, all_data=None):
                         bbox_to_anchor=(1.05, 0.5),
                         fontsize=8,
                         ncol=2,
+                        markerscale=8,  # Scale marker size in legend
                     )
-                    # Increase marker size in legend - FIXED VERSION
-                    for handle in (
-                        legend.legendHandles if hasattr(legend, "legendHandles") else []
-                    ):
-                        handle.set_sizes([40])  # Increase dot size in legend
 
                 plt.tight_layout()
 
@@ -571,13 +568,12 @@ def plot_umap_scatter(umap_dir, all_data=None):
                 plt.xlabel("UMAP Dimension 1")
                 plt.ylabel("UMAP Dimension 2")
 
-                # Add legend with larger dots - FIXED VERSION
-                legend = plt.legend(title="Language", loc="best")
-                # Increase marker size in legend - FIXED VERSION
-                for handle in (
-                    legend.legendHandles if hasattr(legend, "legendHandles") else []
-                ):
-                    handle.set_sizes([50])  # Increase dot size in legend
+                # Add legend with larger dots - FIXED
+                legend = plt.legend(
+                    title="Language",
+                    loc="best",
+                    markerscale=10,  # Scale marker size in legend
+                )
 
                 plt.tight_layout()
 
@@ -610,8 +606,10 @@ def plot_umap_scatter(umap_dir, all_data=None):
 
                         umap_2d = position_embeddings["umap_2d"]
 
-                        # Try to find cluster labels for this position, k, and fold
+                        # Get the exact name used in the clustering script
                         embed_name = f"{position}_umap_2d"
+
+                        # FIXED: Ensure we're using the correct cluster labels
                         if (
                             embed_name in all_data
                             and k in all_data[embed_name]
@@ -622,16 +620,38 @@ def plot_umap_scatter(umap_dir, all_data=None):
                                 fold_number
                             ]
 
+                            # Add debugging info
+                            if args.debug:
+                                print(
+                                    f"Fold {fold_number}, k={k}, position={position}, embedding={embed_name}"
+                                )
+                                print(
+                                    f"Unique cluster labels: {np.unique(cluster_labels, return_counts=True)}"
+                                )
+                                print(f"Shape of UMAP data: {umap_2d.shape}")
+                                print(
+                                    f"Shape of cluster_labels: {cluster_labels.shape}"
+                                )
+
+                            # Verify that we have the correct number of labels
+                            if len(cluster_labels) != len(umap_2d):
+                                print(
+                                    f"WARNING: Mismatch between cluster labels ({len(cluster_labels)}) "
+                                    f"and UMAP points ({len(umap_2d)}) for {embed_name}, k={k}, fold={fold_number}"
+                                )
+                                continue
+
                             # Create a colormap for cluster labels
                             cmap_clusters = plt.cm.get_cmap("tab10", k)
 
                             # Create figure
                             plt.figure(figsize=(12, 10))
 
-                            # Plot each cluster with its own color
+                            # FIXED: Create scatter plots for each cluster with proper legend scaling
+                            scatter_objects = []
                             for cluster_id in range(k):
                                 mask = cluster_labels == cluster_id
-                                plt.scatter(
+                                sc = plt.scatter(
                                     umap_2d[mask, 0],
                                     umap_2d[mask, 1],
                                     c=[cmap_clusters(cluster_id)],
@@ -647,19 +667,13 @@ def plot_umap_scatter(umap_dir, all_data=None):
                             plt.xlabel("UMAP Dimension 1")
                             plt.ylabel("UMAP Dimension 2")
 
-                            # Add legend with larger markers - FIXED VERSION
+                            # FIXED: Create legend with proper marker scaling
                             legend = plt.legend(
                                 title=f"K-means Clusters (k={k})",
                                 loc="best",
                                 bbox_to_anchor=(1.05, 1),
+                                markerscale=10,  # Scale marker size in legend
                             )
-                            # Increase marker size in legend - FIXED VERSION
-                            for handle in (
-                                legend.legendHandles
-                                if hasattr(legend, "legendHandles")
-                                else []
-                            ):
-                                handle.set_sizes([50])  # Increase dot size in legend
 
                             plt.tight_layout()
 
@@ -676,12 +690,37 @@ def plot_umap_scatter(umap_dir, all_data=None):
                             else:
                                 plt.close()
                         else:
+                            if args.debug:
+                                print(
+                                    f"DEBUG: Missing data for {embed_name}, k={k}, fold={fold_number}"
+                                )
+                                if embed_name in all_data:
+                                    print(f"  - embed_name exists in all_data")
+                                    if k in all_data[embed_name]:
+                                        print(f"  - k exists in all_data[{embed_name}]")
+                                        if "cluster_labels" in all_data[embed_name][k]:
+                                            print(
+                                                f"  - cluster_labels exists in all_data[{embed_name}][{k}]"
+                                            )
+                                            if (
+                                                fold_number
+                                                in all_data[embed_name][k][
+                                                    "cluster_labels"
+                                                ]
+                                            ):
+                                                print(
+                                                    f"  - fold_number exists in all_data[{embed_name}][{k}]['cluster_labels']"
+                                                )
+
                             print(
                                 f"Warning: K-means cluster labels for k={k}, position={position}, fold={fold_number} not found"
                             )
 
         except Exception as e:
             print(f"Error processing UMAP file {fold_file}: {e}")
+            import traceback
+
+            traceback.print_exc()
 
     print("UMAP plotting complete.")
 
