@@ -29,7 +29,7 @@ from tqdm import tqdm
 
 # Parse command line arguments
 parser = argparse.ArgumentParser(
-    description="Calculate clustering metrics on UMAP projections."
+    description="Calculate clustering metrics on dimensionality reduced projections."
 )
 # Add OpenBLAS control parameters
 parser.add_argument(
@@ -65,7 +65,7 @@ parser.add_argument(
     "--base_dir",
     type=str,
     default="./",
-    help="Base directory containing umap data directories.",
+    help="Base directory containing dimensionality reduction data directories.",
 )
 parser.add_argument(
     "--cpu_fraction",
@@ -116,7 +116,10 @@ if args.ONLY_MAIN_LABEL:
 else:
     label_type = "filtered_labels"
 
-input_dir = os.path.join(args.base_dir, f"umap_data_{args.N}_{label_type}")
+# Updated input directory to use the new dimensionality reduction directory
+input_dir = os.path.join(
+    args.base_dir, f"dimensionality_reduction_{args.N}_{label_type}"
+)
 output_dir = os.path.join(args.base_dir, f"cluster_metrics_{args.N}_{label_type}")
 
 # Create output directory
@@ -199,7 +202,7 @@ def calculate_metrics_for_k(data, true_labels, k, random_state):
             "completeness": None,
             "davies_bouldin": None,
             "calinski_harabasz": None,
-            "cluster_labels": None,  # Add this line
+            "cluster_labels": None,
         }
 
     # Fit KMeans
@@ -226,7 +229,7 @@ def calculate_metrics_for_k(data, true_labels, k, random_state):
         "completeness": comp_score,
         "davies_bouldin": db_score,
         "calinski_harabasz": ch_score,
-        "cluster_labels": cluster_labels,  # Add this line
+        "cluster_labels": cluster_labels,
     }
 
 
@@ -241,7 +244,7 @@ def process_single_embedding(args):
     return results
 
 
-# Function to process embeddings (UMAP or raw) in parallel
+# Function to process embeddings in parallel
 def process_embeddings_parallel(embedding_tasks, k_values, random_state, num_workers):
     # Prepare tasks
     tasks = [
@@ -267,7 +270,8 @@ def process_fold(
 ):
     start_time = time.time()
     fold_name = os.path.basename(fold_file)
-    fold_number = fold_name.split("_")[2].split(".")[0]
+    # Updated to match the new filename format
+    fold_number = fold_name.split("_")[3].split(".")[0]
 
     print(f"Processing {fold_name}...")
 
@@ -294,12 +298,37 @@ def process_fold(
             (f"{position}_raw", position_embeddings["raw"], true_labels)
         )
 
+        # Add PCA projections
+        for dim in [2, 4, 8, 16]:
+            pca_key = f"pca_{dim}d"
+            if pca_key in position_embeddings:
+                embedding_tasks.append(
+                    (f"{position}_{pca_key}", position_embeddings[pca_key], true_labels)
+                )
+
+        # Add PCA+UMAP projections
+        for dim in [2, 4, 8, 16]:
+            pca_umap_key = f"pca_{dim}d_umap_2d"
+            if pca_umap_key in position_embeddings:
+                embedding_tasks.append(
+                    (
+                        f"{position}_{pca_umap_key}",
+                        position_embeddings[pca_umap_key],
+                        true_labels,
+                    )
+                )
+
         # Add UMAP projections
         for dim in [2, 4, 8, 16, 32]:
             umap_key = f"umap_{dim}d"
-            embedding_tasks.append(
-                (f"{position}_{umap_key}", position_embeddings[umap_key], true_labels)
-            )
+            if umap_key in position_embeddings:
+                embedding_tasks.append(
+                    (
+                        f"{position}_{umap_key}",
+                        position_embeddings[umap_key],
+                        true_labels,
+                    )
+                )
 
     # Process all embeddings in parallel
     print(
@@ -343,11 +372,11 @@ def main():
         print(f"Error: Input directory {input_dir} does not exist.")
         return
 
-    # List fold files
+    # List fold files - updated to match the new filename format
     fold_files = [
         f
         for f in os.listdir(input_dir)
-        if f.startswith("umap_fold_") and f.endswith(".pkl")
+        if f.startswith("dim_reduction_fold_") and f.endswith(".pkl")
     ]
     fold_files.sort()
 

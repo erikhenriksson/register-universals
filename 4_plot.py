@@ -57,8 +57,23 @@ parser.add_argument(
 parser.add_argument(
     "--embedding_types",
     nargs="+",
-    default=["raw", "umap_2d", "umap_4d", "umap_8d", "umap_16d", "umap_32d"],
-    help="Embedding types to plot (default: raw and all UMAP dimensions).",
+    default=[
+        "raw",
+        "pca_2d",
+        "pca_4d",
+        "pca_8d",
+        "pca_16d",  # Added PCA types
+        "pca_2d_umap_2d",
+        "pca_4d_umap_2d",
+        "pca_8d_umap_2d",
+        "pca_16d_umap_2d",  # Added PCA+UMAP types
+        "umap_2d",
+        "umap_4d",
+        "umap_8d",
+        "umap_16d",
+        "umap_32d",
+    ],
+    help="Embedding types to plot (default: raw, all PCA, all PCA+UMAP, all UMAP dimensions).",
 )
 parser.add_argument(
     "--output_format",
@@ -79,16 +94,16 @@ parser.add_argument(
     help="Show plots during execution.",
 )
 parser.add_argument(
-    "--plot_umap",
+    "--plot_dimred",
     action="store_true",
     default=True,
-    help="Generate UMAP 2D scatter plots colored by register (default: True).",
+    help="Generate 2D scatter plots colored by register (default: True).",
 )
 parser.add_argument(
-    "--umap_dir",
+    "--dimred_dir",
     type=str,
     default=None,
-    help="Directory containing UMAP data. If None, will use base_dir/umap_data_N_label_type.",
+    help="Directory containing dimensionality reduction data. If None, will use base_dir/dimensionality_reduction_N_label_type.",
 )
 # NEW PARAMETER: Add cluster numbers to visualize in k-means plots
 parser.add_argument(
@@ -103,6 +118,13 @@ parser.add_argument(
     action="store_true",
     help="Enable debug printing for diagnosing issues.",
 )
+parser.add_argument(
+    "--plot_groups",
+    type=str,
+    choices=["all", "pca", "umap", "pca_umap", "raw"],
+    default="all",
+    help="Which groups of dimensionality reductions to plot (default: all).",
+)
 args = parser.parse_args()
 
 # Setup directory paths
@@ -114,14 +136,39 @@ else:
 input_dir = os.path.join(args.base_dir, f"cluster_metrics_{args.N}_{label_type}")
 output_dir = os.path.join(args.base_dir, f"plots_{args.N}_{label_type}")
 
-# Set UMAP directory
-if args.umap_dir is None:
-    umap_dir = os.path.join(args.base_dir, f"umap_data_{args.N}_{label_type}")
+# Set dimensionality reduction directory
+if args.dimred_dir is None:
+    dimred_dir = os.path.join(
+        args.base_dir, f"dimensionality_reduction_{args.N}_{label_type}"
+    )
 else:
-    umap_dir = args.umap_dir
+    dimred_dir = args.dimred_dir
 
 # Create output directory
 os.makedirs(output_dir, exist_ok=True)
+
+
+# Filter embedding types based on the plot_groups parameter
+def filter_embedding_types():
+    if args.plot_groups == "all":
+        return args.embedding_types
+
+    filtered_types = []
+    if args.plot_groups == "raw" or args.plot_groups == "all":
+        filtered_types.append("raw")
+
+    if args.plot_groups == "pca" or args.plot_groups == "all":
+        filtered_types.extend(["pca_2d", "pca_4d", "pca_8d", "pca_16d"])
+
+    if args.plot_groups == "umap" or args.plot_groups == "all":
+        filtered_types.extend(["umap_2d", "umap_4d", "umap_8d", "umap_16d", "umap_32d"])
+
+    if args.plot_groups == "pca_umap" or args.plot_groups == "all":
+        filtered_types.extend(
+            ["pca_2d_umap_2d", "pca_4d_umap_2d", "pca_8d_umap_2d", "pca_16d_umap_2d"]
+        )
+
+    return filtered_types
 
 
 def load_metrics_data():
@@ -256,16 +303,50 @@ def plot_metric(metric, processed_data):
     """Create plots for a specific metric across different embeddings."""
     print(f"Plotting {metric} scores...")
 
-    # Define a color palette for different embedding types
-    palette = sns.color_palette("husl", len(args.embedding_types))
-    embedding_colors = {et: palette[i] for i, et in enumerate(args.embedding_types)}
+    # Get filtered embedding types
+    embedding_types = filter_embedding_types()
+
+    # Define color palettes for different embedding type groups
+    raw_color = "#1f77b4"  # Blue for raw
+    pca_palette = sns.color_palette("Reds_d", 4)  # Red palette for PCA
+    umap_palette = sns.color_palette("Greens_d", 5)  # Green palette for UMAP
+    pca_umap_palette = sns.color_palette("Purples_d", 4)  # Purple palette for PCA+UMAP
+
+    # Create a combined color mapping
+    embedding_colors = {"raw": raw_color}
+
+    # Add PCA colors
+    for i, dim in enumerate([2, 4, 8, 16]):
+        embedding_colors[f"pca_{dim}d"] = pca_palette[i]
+
+    # Add UMAP colors
+    for i, dim in enumerate([2, 4, 8, 16, 32]):
+        embedding_colors[f"umap_{dim}d"] = umap_palette[min(i, len(umap_palette) - 1)]
+
+    # Add PCA+UMAP colors
+    for i, dim in enumerate([2, 4, 8, 16]):
+        embedding_colors[f"pca_{dim}d_umap_2d"] = pca_umap_palette[i]
 
     # Plot for each embedding position (first, half, last)
     for position in args.embedding_positions:
-        plt.figure(figsize=(12, 8))
+        plt.figure(figsize=(15, 10))
 
-        # Plot each embedding type (raw, umap_2d, etc.)
-        for i, embed_type in enumerate(args.embedding_types):
+        # Group embedding types by category
+        raw_types = [et for et in embedding_types if et == "raw"]
+        pca_types = [et for et in embedding_types if "pca_" in et and "umap" not in et]
+        umap_types = [et for et in embedding_types if "umap_" in et and "pca" not in et]
+        pca_umap_types = [et for et in embedding_types if "pca_" in et and "umap" in et]
+
+        # Sort dimension categories by dimensionality
+        pca_types.sort(key=lambda x: int(x.split("_")[1][:-1]))
+        umap_types.sort(key=lambda x: int(x.split("_")[1][:-1]))
+        pca_umap_types.sort(key=lambda x: int(x.split("_")[1][:-1]))
+
+        # All embedding types in correct order
+        ordered_embed_types = raw_types + pca_types + pca_umap_types + umap_types
+
+        # Plot each embedding type in order
+        for embed_type in ordered_embed_types:
             embed_name = f"{position}_{embed_type}"
 
             # Skip if this embedding is not in the data
@@ -288,7 +369,7 @@ def plot_metric(metric, processed_data):
             valid_mean = [mean_values[i] for i in valid_indices]
 
             # For standard deviation shading
-            if args.embedding_types.index(embed_type) == 0:  # For first type, use std
+            if embed_type == "raw":  # For raw, use std
                 lower_bound = [
                     embed_data["mean"][i] - embed_data["std"][i]
                     if embed_data["mean"][i] is not None
@@ -313,8 +394,15 @@ def plot_metric(metric, processed_data):
                 valid_k,
                 valid_mean,
                 label=embed_type,
-                color=embedding_colors[embed_type],
+                color=embedding_colors.get(embed_type, "black"),
                 linewidth=2,
+                linestyle="-"
+                if "umap" in embed_type
+                else "--"
+                if "pca" in embed_type and "umap" in embed_type
+                else "-."
+                if "pca" in embed_type
+                else ":",
             )
 
             # Plot shaded area for range
@@ -323,7 +411,7 @@ def plot_metric(metric, processed_data):
                 valid_lower,
                 valid_upper,
                 alpha=0.1,
-                color=embedding_colors[embed_type],
+                color=embedding_colors.get(embed_type, "black"),
             )
 
         # Customize plot
@@ -360,8 +448,73 @@ def plot_metric(metric, processed_data):
             plt.ylabel(f"{metric.capitalize()} Score")
 
         plt.xlabel("Number of Clusters (k)")
-        plt.legend(title="Embedding Type", loc="best")
+
+        # Improve legend with grouping
+        handles, labels = plt.gca().get_legend_handles_labels()
+        by_label = dict(zip(labels, handles))
+
+        # Create legend with sections
+        legend_elements = []
+
+        # Add raw if present
+        if any(label == "raw" for label in labels):
+            legend_elements.append(by_label["raw"])
+            legend_elements.append("raw")
+
+        # Add PCA section if present
+        pca_labels = [
+            label for label in labels if "pca_" in label and "umap" not in label
+        ]
+        if pca_labels:
+            legend_elements.append(
+                plt.Line2D([0], [0], color="white", alpha=0.0)
+            )  # spacer
+            legend_elements.append("PCA")
+            for label in sorted(pca_labels, key=lambda x: int(x.split("_")[1][:-1])):
+                legend_elements.append(by_label[label])
+                legend_elements.append(label)
+
+        # Add PCA+UMAP section if present
+        pca_umap_labels = [
+            label for label in labels if "pca_" in label and "umap" in label
+        ]
+        if pca_umap_labels:
+            legend_elements.append(
+                plt.Line2D([0], [0], color="white", alpha=0.0)
+            )  # spacer
+            legend_elements.append("PCA+UMAP")
+            for label in sorted(
+                pca_umap_labels, key=lambda x: int(x.split("_")[1][:-1])
+            ):
+                legend_elements.append(by_label[label])
+                legend_elements.append(label)
+
+        # Add UMAP section if present
+        umap_labels = [
+            label for label in labels if "umap_" in label and "pca" not in label
+        ]
+        if umap_labels:
+            legend_elements.append(
+                plt.Line2D([0], [0], color="white", alpha=0.0)
+            )  # spacer
+            legend_elements.append("UMAP")
+            for label in sorted(umap_labels, key=lambda x: int(x.split("_")[1][:-1])):
+                legend_elements.append(by_label[label])
+                legend_elements.append(label)
+
+        # Add legend
+        if legend_elements:
+            plt.legend(
+                legend_elements[::2],
+                legend_elements[1::2],
+                handler_map={str: plt.matplotlib.legend_handler.HandlerBase()},
+                loc="best",
+                bbox_to_anchor=(1.05, 1),
+                fontsize=10,
+            )
+
         plt.grid(True)
+        plt.tight_layout()
 
         # Save plot
         output_file = os.path.join(
@@ -394,33 +547,43 @@ def get_majority_labels(metadata):
     return np.array(labels)
 
 
-def plot_umap_scatter(umap_dir, all_data=None):
-    """Create scatter plots of 2D UMAP projections colored by register and k-means clusters."""
-    print(f"Plotting UMAP 2D projections from {umap_dir}...")
+def plot_2d_projections(dimred_dir, all_data=None):
+    """Create scatter plots of 2D projections colored by register and k-means clusters."""
+    print(f"Plotting 2D projections from {dimred_dir}...")
 
-    # Check if UMAP directory exists
-    if not os.path.exists(umap_dir):
-        print(f"Error: UMAP directory {umap_dir} does not exist.")
+    # Check if directory exists
+    if not os.path.exists(dimred_dir):
+        print(f"Error: Directory {dimred_dir} does not exist.")
         return
 
     # List fold files
     fold_files = [
         f
-        for f in os.listdir(umap_dir)
-        if f.startswith("umap_fold_") and f.endswith(".pkl")
+        for f in os.listdir(dimred_dir)
+        if f.startswith("dim_reduction_fold_") and f.endswith(".pkl")
     ]
     fold_files.sort()
 
     if not fold_files:
-        print(f"Error: No UMAP fold files found in {umap_dir}")
+        print(f"Error: No fold files found in {dimred_dir}")
         return
 
-    print(f"Found {len(fold_files)} UMAP fold files to process")
+    print(f"Found {len(fold_files)} fold files to process")
+
+    # Define which 2D embeddings to plot
+    plot_keys = [
+        "umap_2d",  # Original UMAP 2D
+        "pca_2d",  # PCA 2D
+        "pca_2d_umap_2d",  # UMAP 2D on PCA 2D
+        "pca_4d_umap_2d",  # UMAP 2D on PCA 4D
+        "pca_8d_umap_2d",  # UMAP 2D on PCA 8D
+        "pca_16d_umap_2d",  # UMAP 2D on PCA 16D
+    ]
 
     # Process each fold
-    for fold_file in tqdm(fold_files, desc="Creating UMAP plots"):
-        fold_path = os.path.join(umap_dir, fold_file)
-        fold_number = fold_file.split("_")[2].split(".")[0]
+    for fold_file in tqdm(fold_files, desc="Creating 2D projection plots"):
+        fold_path = os.path.join(dimred_dir, fold_file)
+        fold_number = fold_file.split("_")[3].split(".")[0]
 
         try:
             # Load the fold data
@@ -450,6 +613,14 @@ def plot_umap_scatter(umap_dir, all_data=None):
             # Create a dictionary mapping labels to colors
             label_colors = {label: cmap(i) for i, label in enumerate(unique_labels)}
 
+            # Get language info for each point
+            languages = np.array([item["lang"] for item in metadata])
+            unique_languages = np.unique(languages)
+
+            # Create a colormap for languages
+            num_languages = len(unique_languages)
+            cmap_lang = plt.cm.get_cmap("Set1", max(num_languages, 9))
+
             # Create scatter plots for each position (first, half, last)
             for position in args.embedding_positions:
                 if position not in embeddings:
@@ -458,138 +629,122 @@ def plot_umap_scatter(umap_dir, all_data=None):
 
                 position_embeddings = embeddings[position]
 
-                # Get 2D UMAP projections
-                if "umap_2d" not in position_embeddings:
-                    print(f"Warning: 2D UMAP not found for {position} embeddings")
-                    continue
+                # Plot each 2D projection
+                for embed_key in plot_keys:
+                    if embed_key not in position_embeddings:
+                        if args.debug:
+                            print(
+                                f"Warning: {embed_key} not found for {position} embeddings"
+                            )
+                        continue
 
-                umap_2d = position_embeddings["umap_2d"]
+                    proj_2d = position_embeddings[embed_key]
 
-                # Create figure
-                plt.figure(figsize=(12, 10))
+                    # 1. Plot by register label
+                    plt.figure(figsize=(12, 10))
 
-                # Plot each label with its own color
-                for label in unique_labels:
-                    mask = labels == label
-                    plt.scatter(
-                        umap_2d[mask, 0],
-                        umap_2d[mask, 1],
-                        c=[label_colors[label]],
-                        label=label,
-                        alpha=0.7,
-                        s=5,
-                        edgecolors="none",
+                    # Plot each label with its own color
+                    for label in unique_labels:
+                        mask = labels == label
+                        plt.scatter(
+                            proj_2d[mask, 0],
+                            proj_2d[mask, 1],
+                            c=[label_colors[label]],
+                            label=label,
+                            alpha=0.7,
+                            s=5,
+                            edgecolors="none",
+                        )
+
+                    # Add title and labels
+                    plt.title(
+                        f"{embed_key} Projection ({position} embeddings), Fold {fold_number}"
                     )
+                    plt.xlabel("Dimension 1")
+                    plt.ylabel("Dimension 2")
 
-                # Add labels and legend
-                plt.title(
-                    f"2D UMAP Projection ({position} embeddings), Fold {fold_number}"
-                )
-                plt.xlabel("UMAP Dimension 1")
-                plt.ylabel("UMAP Dimension 2")
+                    # Add legend with reasonable size and position
+                    if num_labels <= 20:
+                        # Full legend for manageable number of labels
+                        legend = plt.legend(
+                            title="Register",
+                            loc="best",
+                            bbox_to_anchor=(1.05, 1),
+                            fontsize=10,
+                            markerscale=10,  # Scale marker size in legend
+                        )
+                    else:
+                        # Create a more compact legend for many labels
+                        legend = plt.legend(
+                            title="Register",
+                            loc="center left",
+                            bbox_to_anchor=(1.05, 0.5),
+                            fontsize=8,
+                            ncol=2,
+                            markerscale=8,  # Scale marker size in legend
+                        )
 
-                # Add legend with reasonable size and position - FIXED
-                if num_labels <= 20:
-                    # Full legend for manageable number of labels
+                    plt.tight_layout()
+
+                    # Save plot
+                    output_file = os.path.join(
+                        output_dir,
+                        f"{embed_key}_{position}_register_fold_{fold_number}.{args.output_format}",
+                    )
+                    plt.savefig(output_file, dpi=args.dpi, bbox_inches="tight")
+                    print(f"Saved plot to {output_file}")
+
+                    # Show plot if requested
+                    if args.show_plots:
+                        plt.show()
+                    else:
+                        plt.close()
+
+                    # 2. Plot by language
+                    plt.figure(figsize=(12, 10))
+
+                    # Plot each language with its own color
+                    for i, lang in enumerate(unique_languages):
+                        mask = languages == lang
+                        plt.scatter(
+                            proj_2d[mask, 0],
+                            proj_2d[mask, 1],
+                            c=[cmap_lang(i)],
+                            label=lang,
+                            alpha=0.7,
+                            s=5,
+                            edgecolors="none",
+                        )
+
+                    # Add labels and legend
+                    plt.title(
+                        f"{embed_key} by Language ({position} embeddings), Fold {fold_number}"
+                    )
+                    plt.xlabel("Dimension 1")
+                    plt.ylabel("Dimension 2")
+
+                    # Add legend with larger dots
                     legend = plt.legend(
-                        title="Register",
+                        title="Language",
                         loc="best",
-                        bbox_to_anchor=(1.05, 1),
-                        fontsize=10,
                         markerscale=10,  # Scale marker size in legend
                     )
-                else:
-                    # Create a more compact legend for many labels
-                    legend = plt.legend(
-                        title="Register",
-                        loc="center left",
-                        bbox_to_anchor=(1.05, 0.5),
-                        fontsize=8,
-                        ncol=2,
-                        markerscale=8,  # Scale marker size in legend
+
+                    plt.tight_layout()
+
+                    # Save plot
+                    output_file = os.path.join(
+                        output_dir,
+                        f"{embed_key}_{position}_lang_fold_{fold_number}.{args.output_format}",
                     )
+                    plt.savefig(output_file, dpi=args.dpi, bbox_inches="tight")
+                    print(f"Saved plot to {output_file}")
 
-                plt.tight_layout()
-
-                # Save plot
-                output_file = os.path.join(
-                    output_dir,
-                    f"umap_2d_{position}_fold_{fold_number}.{args.output_format}",
-                )
-                plt.savefig(output_file, dpi=args.dpi, bbox_inches="tight")
-                print(f"Saved plot to {output_file}")
-
-                # Show plot if requested
-                if args.show_plots:
-                    plt.show()
-                else:
-                    plt.close()
-
-            # Create aggregate plot of all languages for each position
-            for position in args.embedding_positions:
-                if position not in embeddings:
-                    continue
-
-                position_embeddings = embeddings[position]
-
-                if "umap_2d" not in position_embeddings:
-                    continue
-
-                umap_2d = position_embeddings["umap_2d"]
-
-                # Get language info for each point
-                languages = np.array([item["lang"] for item in metadata])
-                unique_languages = np.unique(languages)
-
-                # Create a colormap for languages
-                num_languages = len(unique_languages)
-                cmap_lang = plt.cm.get_cmap("Set1", max(num_languages, 9))
-
-                # Create figure
-                plt.figure(figsize=(12, 10))
-
-                # Plot each language with its own color
-                for i, lang in enumerate(unique_languages):
-                    mask = languages == lang
-                    plt.scatter(
-                        umap_2d[mask, 0],
-                        umap_2d[mask, 1],
-                        c=[cmap_lang(i)],
-                        label=lang,
-                        alpha=0.7,
-                        s=5,
-                        edgecolors="none",
-                    )
-
-                # Add labels and legend
-                plt.title(
-                    f"2D UMAP by Language ({position} embeddings), Fold {fold_number}"
-                )
-                plt.xlabel("UMAP Dimension 1")
-                plt.ylabel("UMAP Dimension 2")
-
-                # Add legend with larger dots - FIXED
-                legend = plt.legend(
-                    title="Language",
-                    loc="best",
-                    markerscale=10,  # Scale marker size in legend
-                )
-
-                plt.tight_layout()
-
-                # Save plot
-                output_file = os.path.join(
-                    output_dir,
-                    f"umap_2d_{position}_lang_fold_{fold_number}.{args.output_format}",
-                )
-                plt.savefig(output_file, dpi=args.dpi, bbox_inches="tight")
-                print(f"Saved plot to {output_file}")
-
-                # Show plot if requested
-                if args.show_plots:
-                    plt.show()
-                else:
-                    plt.close()
+                    # Show plot if requested
+                    if args.show_plots:
+                        plt.show()
+                    else:
+                        plt.close()
 
             # If all_data is provided, create scatter plots colored by K-means clusters
             if all_data is not None:
@@ -601,128 +756,136 @@ def plot_umap_scatter(umap_dir, all_data=None):
 
                         position_embeddings = embeddings[position]
 
-                        if "umap_2d" not in position_embeddings:
-                            continue
-
-                        umap_2d = position_embeddings["umap_2d"]
-
-                        # Get the exact name used in the clustering script
-                        embed_name = f"{position}_umap_2d"
-
-                        # FIXED: Ensure we're using the correct cluster labels
-                        if (
-                            embed_name in all_data
-                            and k in all_data[embed_name]
-                            and "cluster_labels" in all_data[embed_name][k]
-                            and fold_number in all_data[embed_name][k]["cluster_labels"]
-                        ):
-                            cluster_labels = all_data[embed_name][k]["cluster_labels"][
-                                fold_number
-                            ]
-
-                            # Add debugging info
-                            if args.debug:
-                                print(
-                                    f"Fold {fold_number}, k={k}, position={position}, embedding={embed_name}"
-                                )
-                                print(
-                                    f"Unique cluster labels: {np.unique(cluster_labels, return_counts=True)}"
-                                )
-                                print(f"Shape of UMAP data: {umap_2d.shape}")
-                                print(
-                                    f"Shape of cluster_labels: {cluster_labels.shape}"
-                                )
-
-                            # Verify that we have the correct number of labels
-                            if len(cluster_labels) != len(umap_2d):
-                                print(
-                                    f"WARNING: Mismatch between cluster labels ({len(cluster_labels)}) "
-                                    f"and UMAP points ({len(umap_2d)}) for {embed_name}, k={k}, fold={fold_number}"
-                                )
+                        # Plot each 2D projection with K-means clusters
+                        for embed_key in plot_keys:
+                            if embed_key not in position_embeddings:
                                 continue
 
-                            # Create a colormap for cluster labels
-                            cmap_clusters = plt.cm.get_cmap("tab10", k)
+                            proj_2d = position_embeddings[embed_key]
 
-                            # Create figure
-                            plt.figure(figsize=(12, 10))
+                            # Get the exact name used in the clustering script
+                            embed_name = f"{position}_{embed_key}"
 
-                            # FIXED: Create scatter plots for each cluster with proper legend scaling
-                            scatter_objects = []
-                            for cluster_id in range(k):
-                                mask = cluster_labels == cluster_id
-                                sc = plt.scatter(
-                                    umap_2d[mask, 0],
-                                    umap_2d[mask, 1],
-                                    c=[cmap_clusters(cluster_id)],
-                                    label=f"Cluster {cluster_id}",
-                                    alpha=0.7,
-                                    s=5,
-                                    edgecolors="none",
+                            # Check for cluster labels
+                            if (
+                                embed_name in all_data
+                                and k in all_data[embed_name]
+                                and "cluster_labels" in all_data[embed_name][k]
+                                and fold_number
+                                in all_data[embed_name][k]["cluster_labels"]
+                            ):
+                                cluster_labels = all_data[embed_name][k][
+                                    "cluster_labels"
+                                ][fold_number]
+
+                                # Add debugging info
+                                if args.debug:
+                                    print(
+                                        f"Fold {fold_number}, k={k}, position={position}, embedding={embed_name}"
+                                    )
+                                    print(
+                                        f"Unique cluster labels: {np.unique(cluster_labels, return_counts=True)}"
+                                    )
+                                    print(f"Shape of projection data: {proj_2d.shape}")
+                                    print(
+                                        f"Shape of cluster_labels: {cluster_labels.shape}"
+                                    )
+
+                                # Verify that we have the correct number of labels
+                                if len(cluster_labels) != len(proj_2d):
+                                    print(
+                                        f"WARNING: Mismatch between cluster labels ({len(cluster_labels)}) "
+                                        f"and points ({len(proj_2d)}) for {embed_name}, k={k}, fold={fold_number}"
+                                    )
+                                    continue
+
+                                # Create a colormap for cluster labels
+                                cmap_clusters = plt.cm.get_cmap("tab10", k)
+
+                                # Create figure
+                                plt.figure(figsize=(12, 10))
+
+                                # Create scatter plots for each cluster with proper legend scaling
+                                for cluster_id in range(k):
+                                    mask = cluster_labels == cluster_id
+                                    plt.scatter(
+                                        proj_2d[mask, 0],
+                                        proj_2d[mask, 1],
+                                        c=[cmap_clusters(cluster_id)],
+                                        label=f"Cluster {cluster_id}",
+                                        alpha=0.7,
+                                        s=5,
+                                        edgecolors="none",
+                                    )
+                                plt.title(
+                                    f"{embed_key} with K-means (k={k}, {position} embeddings), Fold {fold_number}"
+                                )
+                                plt.xlabel("Dimension 1")
+                                plt.ylabel("Dimension 2")
+
+                                # Create legend with proper marker scaling
+                                legend = plt.legend(
+                                    title=f"K-means Clusters (k={k})",
+                                    loc="best",
+                                    bbox_to_anchor=(1.05, 1),
+                                    markerscale=10,  # Scale marker size in legend
                                 )
 
-                            plt.title(
-                                f"2D UMAP with K-means (k={k}, {position} embeddings), Fold {fold_number}"
-                            )
-                            plt.xlabel("UMAP Dimension 1")
-                            plt.ylabel("UMAP Dimension 2")
+                                plt.tight_layout()
 
-                            # FIXED: Create legend with proper marker scaling
-                            legend = plt.legend(
-                                title=f"K-means Clusters (k={k})",
-                                loc="best",
-                                bbox_to_anchor=(1.05, 1),
-                                markerscale=10,  # Scale marker size in legend
-                            )
+                                # Save plot
+                                output_file = os.path.join(
+                                    output_dir,
+                                    f"{embed_key}_{position}_kmeans_k{k}_fold_{fold_number}.{args.output_format}",
+                                )
+                                plt.savefig(
+                                    output_file, dpi=args.dpi, bbox_inches="tight"
+                                )
+                                print(f"Saved plot to {output_file}")
 
-                            plt.tight_layout()
-
-                            # Save plot
-                            output_file = os.path.join(
-                                output_dir,
-                                f"umap_2d_{position}_kmeans_k{k}_fold_{fold_number}.{args.output_format}",
-                            )
-                            plt.savefig(output_file, dpi=args.dpi, bbox_inches="tight")
-                            print(f"Saved plot to {output_file}")
-
-                            if args.show_plots:
-                                plt.show()
+                                if args.show_plots:
+                                    plt.show()
+                                else:
+                                    plt.close()
                             else:
-                                plt.close()
-                        else:
-                            if args.debug:
-                                print(
-                                    f"DEBUG: Missing data for {embed_name}, k={k}, fold={fold_number}"
-                                )
-                                if embed_name in all_data:
-                                    print(f"  - embed_name exists in all_data")
-                                    if k in all_data[embed_name]:
-                                        print(f"  - k exists in all_data[{embed_name}]")
-                                        if "cluster_labels" in all_data[embed_name][k]:
+                                if args.debug:
+                                    print(
+                                        f"DEBUG: Missing data for {embed_name}, k={k}, fold={fold_number}"
+                                    )
+                                    if embed_name in all_data:
+                                        print(f"  - embed_name exists in all_data")
+                                        if k in all_data[embed_name]:
                                             print(
-                                                f"  - cluster_labels exists in all_data[{embed_name}][{k}]"
+                                                f"  - k exists in all_data[{embed_name}]"
                                             )
                                             if (
-                                                fold_number
-                                                in all_data[embed_name][k][
-                                                    "cluster_labels"
-                                                ]
+                                                "cluster_labels"
+                                                in all_data[embed_name][k]
                                             ):
                                                 print(
-                                                    f"  - fold_number exists in all_data[{embed_name}][{k}]['cluster_labels']"
+                                                    f"  - cluster_labels exists in all_data[{embed_name}][{k}]"
                                                 )
+                                                if (
+                                                    fold_number
+                                                    in all_data[embed_name][k][
+                                                        "cluster_labels"
+                                                    ]
+                                                ):
+                                                    print(
+                                                        f"  - fold_number exists in all_data[{embed_name}][{k}]['cluster_labels']"
+                                                    )
 
-                            print(
-                                f"Warning: K-means cluster labels for k={k}, position={position}, fold={fold_number} not found"
-                            )
+                                print(
+                                    f"Warning: K-means cluster labels for k={k}, position={position}, embedding={embed_key}, fold={fold_number} not found"
+                                )
 
         except Exception as e:
-            print(f"Error processing UMAP file {fold_file}: {e}")
+            print(f"Error processing fold file {fold_file}: {e}")
             import traceback
 
             traceback.print_exc()
 
-    print("UMAP plotting complete.")
+    print("2D projection plotting complete.")
 
 
 def main():
@@ -731,6 +894,10 @@ def main():
     print(f"Input directory: {input_dir}")
     print(f"Output directory: {output_dir}")
     print(f"Metrics to plot: {args.metrics}")
+
+    # Print info about which embedding types we're using
+    embedding_types = filter_embedding_types()
+    print(f"Using embedding types: {embedding_types}")
 
     # Plot metrics
     print("\n=== PLOTTING CLUSTERING METRICS ===")
@@ -747,16 +914,16 @@ def main():
         for metric in args.metrics:
             plot_metric(metric, processed_data)
 
-    # Plot UMAP visualizations if requested
-    if args.plot_umap:
-        print("\n=== PLOTTING UMAP VISUALIZATIONS ===")
-        print(f"UMAP data directory: {umap_dir}")
+    # Plot 2D visualizations if requested
+    if args.plot_dimred:
+        print("\n=== PLOTTING 2D VISUALIZATIONS ===")
+        print(f"Data directory: {dimred_dir}")
 
-        if not os.path.exists(umap_dir):
-            print(f"Error: UMAP directory {umap_dir} does not exist.")
-            print("Skipping UMAP plots.")
+        if not os.path.exists(dimred_dir):
+            print(f"Error: Directory {dimred_dir} does not exist.")
+            print("Skipping 2D plots.")
         else:
-            plot_umap_scatter(umap_dir, all_data)
+            plot_2d_projections(dimred_dir, all_data)
 
     print(f"\nPlot generation complete. Results saved to {output_dir}/")
 
