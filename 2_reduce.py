@@ -233,35 +233,13 @@ def process_position_embeddings(
                     f"(explained variance: {explained_variance:.2%})"
                 )
 
-    # 2. Prepare PCA+UMAP tasks
-    pca_umap_tasks = [
-        (pca_results[dim], dim, umap_params)
-        for dim in pca_dimensions
-        if dim in pca_results
-    ]
+    # Add this section - import sys at the top of the script if not already there
+    import sys
 
-    # Run UMAP on PCA results
-    with ProcessPoolExecutor(max_workers=num_workers) as executor:
-        for dim, result in executor.map(process_pca_umap_embedding, pca_umap_tasks):
-            if result is not None:
-                results[f"pca_{dim}d_umap_2d"] = result
-                print(
-                    f"    Completed 2D UMAP on {dim}D PCA projection for {position_name} tokens"
-                )
-
-    # 3. Prepare UMAP tasks for parallel execution
-    umap_tasks = [(embeddings, dim, umap_params) for dim in umap_dimensions]
-
-    # Run UMAP in parallel for different dimensions
-    with ProcessPoolExecutor(max_workers=num_workers) as executor:
-        for dim, result in executor.map(process_umap_embedding, umap_tasks):
-            if result is not None:
-                results[f"umap_{dim}d"] = result
-                print(
-                    f"    Completed {dim}D UMAP projection for {position_name} tokens"
-                )
-
-    return results
+    print(
+        f"PCA for {position_name} tokens completed. Exiting early to prevent further processing."
+    )
+    sys.exit(0)  # Exit with success code
 
 
 # Function to process a single fold file
