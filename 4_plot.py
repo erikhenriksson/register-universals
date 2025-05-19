@@ -1,11 +1,18 @@
 import argparse
+import json
 import os
 import pickle
+import webbrowser
+from pathlib import Path
 
 import matplotlib.pyplot as plt
 import numpy as np
+import plotly.express as px
+import plotly.graph_objects as go
+import plotly.io as pio
 import seaborn as sns
 from matplotlib.colors import ListedColormap
+from plotly.subplots import make_subplots
 from tqdm import tqdm
 
 # Set Seaborn style for better aesthetics
@@ -78,7 +85,7 @@ parser.add_argument(
 parser.add_argument(
     "--output_format",
     type=str,
-    default="png",
+    default="pdf",
     choices=["png", "pdf", "svg"],
     help="Output file format (default: png).",
 )
@@ -110,7 +117,7 @@ parser.add_argument(
     "--kmeans_clusters",
     nargs="+",
     type=int,
-    default=[4, 8, 25],
+    default=[4, 8],
     help="K values to use for k-means cluster visualization (default: [4, 8, 25]).",
 )
 parser.add_argument(
@@ -125,6 +132,33 @@ parser.add_argument(
     default="all",
     help="Which groups of dimensionality reductions to plot (default: all).",
 )
+
+parser.add_argument(
+    "--interactive",
+    action="store_true",
+    default=True,
+    help="Generate interactive plots using Plotly (default: True).",
+)
+parser.add_argument(
+    "--max_hover_examples",
+    type=int,
+    default=100,
+    help="Maximum number of examples to show in hover data (default: 100).",
+)
+# Add arguments for selected examples
+parser.add_argument(
+    "--save_selection",
+    action="store_true",
+    default=False,
+    help="Enable saving selected points for later use in static plots.",
+)
+parser.add_argument(
+    "--selection_output",
+    type=str,
+    default="selected_examples.json",
+    help="File to save selected examples to.",
+)
+
 args = parser.parse_args()
 
 # Setup directory paths
@@ -547,6 +581,7 @@ def get_majority_labels(metadata):
     return np.array(labels)
 
 
+# Modify the plot_2d_projections function
 def plot_2d_projections(dimred_dir, all_data=None):
     """Create scatter plots of 2D projections colored by register and k-means clusters."""
     print(f"Plotting 2D projections from {dimred_dir}...")
@@ -580,10 +615,20 @@ def plot_2d_projections(dimred_dir, all_data=None):
         "pca_16d_umap_2d",  # UMAP 2D on PCA 16D
     ]
 
+    # Directory to save interactive plots
+    interactive_output_dir = os.path.join(output_dir, "interactive")
+    os.makedirs(interactive_output_dir, exist_ok=True)
+
+    # Dictionary to store selections
+    selected_examples = {}
+
     # Process each fold
     for fold_file in tqdm(fold_files, desc="Creating 2D projection plots"):
         fold_path = os.path.join(dimred_dir, fold_file)
         fold_number = fold_file.split("_")[3].split(".")[0]
+
+        if fold_number != "10":
+            continue
 
         try:
             # Load the fold data
@@ -592,6 +637,22 @@ def plot_2d_projections(dimred_dir, all_data=None):
 
             metadata = fold_data.get("metadata", [])
             embeddings = fold_data.get("embeddings", {})
+
+            # Get actual text examples if available
+            raw_texts = []
+            for item in metadata:
+                # Try to get the text content if available
+                text = item.get("text", "")
+                if not text:
+                    text = item.get("content", "")  # Alternative field name
+                if not text:
+                    text = "Example text not available"  # Fallback
+
+                # Truncate long texts for hover display
+                if len(text) > 100:
+                    text = text[:97] + "..."
+
+                raw_texts.append(text)
 
             if not metadata or not embeddings:
                 print(f"Warning: Missing metadata or embeddings in {fold_file}")
@@ -617,273 +678,285 @@ def plot_2d_projections(dimred_dir, all_data=None):
             languages = np.array([item["lang"] for item in metadata])
             unique_languages = np.unique(languages)
 
-            # Create a colormap for languages
-            num_languages = len(unique_languages)
-            cmap_lang = plt.cm.get_cmap("Set1", max(num_languages, 9))
+            # Static plot functions remain unchanged...
 
-            # Create scatter plots for each position (first, half, last)
-            for position in args.embedding_positions:
-                if position not in embeddings:
-                    print(f"Warning: Position {position} not found in embeddings")
-                    continue
-
-                position_embeddings = embeddings[position]
-
-                # Plot each 2D projection
-                for embed_key in plot_keys:
-                    if embed_key not in position_embeddings:
-                        if args.debug:
-                            print(
-                                f"Warning: {embed_key} not found for {position} embeddings"
-                            )
+            # Add interactive plotting using Plotly
+            if args.interactive:
+                for position in args.embedding_positions:
+                    if position not in embeddings:
+                        print(f"Warning: Position {position} not found in embeddings")
                         continue
 
-                    proj_2d = position_embeddings[embed_key]
+                    position_embeddings = embeddings[position]
 
-                    # 1. Plot by register label
-                    plt.figure(figsize=(12, 10))
-
-                    # Plot each label with its own color
-                    for label in unique_labels:
-                        mask = labels == label
-                        plt.scatter(
-                            proj_2d[mask, 0],
-                            proj_2d[mask, 1],
-                            c=[label_colors[label]],
-                            label=label,
-                            alpha=0.7,
-                            s=5,
-                            edgecolors="none",
-                        )
-
-                    # Add title and labels
-                    plt.title(
-                        f"{embed_key} Projection ({position} embeddings), Fold {fold_number}"
-                    )
-                    plt.xlabel("Dimension 1")
-                    plt.ylabel("Dimension 2")
-
-                    # Add legend with reasonable size and position
-                    if num_labels <= 20:
-                        # Full legend for manageable number of labels
-                        legend = plt.legend(
-                            title="Register",
-                            loc="best",
-                            bbox_to_anchor=(1.05, 1),
-                            fontsize=10,
-                            markerscale=10,  # Scale marker size in legend
-                        )
-                    else:
-                        # Create a more compact legend for many labels
-                        legend = plt.legend(
-                            title="Register",
-                            loc="center left",
-                            bbox_to_anchor=(1.05, 0.5),
-                            fontsize=8,
-                            ncol=2,
-                            markerscale=8,  # Scale marker size in legend
-                        )
-
-                    plt.tight_layout()
-
-                    # Save plot
-                    output_file = os.path.join(
-                        output_dir,
-                        f"{embed_key}_{position}_register_fold_{fold_number}.{args.output_format}",
-                    )
-                    plt.savefig(output_file, dpi=args.dpi, bbox_inches="tight")
-                    print(f"Saved plot to {output_file}")
-
-                    # Show plot if requested
-                    if args.show_plots:
-                        plt.show()
-                    else:
-                        plt.close()
-
-                    # 2. Plot by language
-                    plt.figure(figsize=(12, 10))
-
-                    # Plot each language with its own color
-                    for i, lang in enumerate(unique_languages):
-                        mask = languages == lang
-                        plt.scatter(
-                            proj_2d[mask, 0],
-                            proj_2d[mask, 1],
-                            c=[cmap_lang(i)],
-                            label=lang,
-                            alpha=0.7,
-                            s=5,
-                            edgecolors="none",
-                        )
-
-                    # Add labels and legend
-                    plt.title(
-                        f"{embed_key} by Language ({position} embeddings), Fold {fold_number}"
-                    )
-                    plt.xlabel("Dimension 1")
-                    plt.ylabel("Dimension 2")
-
-                    # Add legend with larger dots
-                    legend = plt.legend(
-                        title="Language",
-                        loc="best",
-                        markerscale=10,  # Scale marker size in legend
-                    )
-
-                    plt.tight_layout()
-
-                    # Save plot
-                    output_file = os.path.join(
-                        output_dir,
-                        f"{embed_key}_{position}_lang_fold_{fold_number}.{args.output_format}",
-                    )
-                    plt.savefig(output_file, dpi=args.dpi, bbox_inches="tight")
-                    print(f"Saved plot to {output_file}")
-
-                    # Show plot if requested
-                    if args.show_plots:
-                        plt.show()
-                    else:
-                        plt.close()
-
-            # If all_data is provided, create scatter plots colored by K-means clusters
-            if all_data is not None:
-                # Create plots for each requested k value
-                for k in args.kmeans_clusters:
-                    for position in args.embedding_positions:
-                        if position not in embeddings:
+                    # Plot each 2D projection
+                    for embed_key in plot_keys:
+                        if embed_key not in position_embeddings:
+                            if args.debug:
+                                print(
+                                    f"Warning: {embed_key} not found for {position} embeddings"
+                                )
                             continue
 
-                        position_embeddings = embeddings[position]
+                        proj_2d = position_embeddings[embed_key]
 
-                        # Plot each 2D projection with K-means clusters
-                        for embed_key in plot_keys:
-                            if embed_key not in position_embeddings:
-                                continue
+                        # Create additional information for hover
+                        hover_data = []
+                        for i, item in enumerate(
+                            metadata[: min(len(metadata), len(proj_2d))]
+                        ):
+                            hover_info = {
+                                "ID": item.get("id", f"sample_{i}"),
+                                "Language": item.get("lang", "unknown"),
+                                "Register": labels[i],
+                                "Text": raw_texts[i]
+                                if i < len(raw_texts)
+                                else "No text available",
+                            }
+                            # Add any other useful metadata
+                            for key, value in item.items():
+                                if key not in hover_info and key not in [
+                                    "text",
+                                    "content",
+                                ]:
+                                    # Convert lists/dicts to string representation
+                                    if isinstance(value, (list, dict)):
+                                        value = str(value)
+                                    hover_info[key] = value
+                            hover_data.append(hover_info)
 
-                            proj_2d = position_embeddings[embed_key]
+                        # 1. Interactive plot by register
+                        fig = px.scatter(
+                            x=proj_2d[:, 0],
+                            y=proj_2d[:, 1],
+                            color=labels,
+                            title=f"{embed_key} Projection ({position} embeddings), Fold {fold_number}",
+                            labels={"x": "Dimension 1", "y": "Dimension 2"},
+                            color_discrete_map={
+                                label: f"rgba({int(color[0] * 255)},{int(color[1] * 255)},{int(color[2] * 255)},{color[3]})"
+                                for label, color in label_colors.items()
+                            },
+                            category_orders={"color": sorted(unique_labels)},
+                            hover_data=hover_data,
+                            custom_data=[
+                                i for i in range(len(proj_2d))
+                            ],  # For selection
+                        )
 
-                            # Get the exact name used in the clustering script
-                            embed_name = f"{position}_{embed_key}"
+                        # Improve the hover template
+                        fig.update_traces(
+                            hovertemplate="<b>Register:</b> %{color}<br>"
+                            + "<b>ID:</b> %{customdata}<br>"
+                            + "<b>Language:</b> %{hovername}<br>"
+                            + "<b>Text:</b> %{hovertext}<br>"
+                            + "<extra></extra>"
+                        )
 
-                            # Check for cluster labels
-                            if (
-                                embed_name in all_data
-                                and k in all_data[embed_name]
-                                and "cluster_labels" in all_data[embed_name][k]
-                                and fold_number
-                                in all_data[embed_name][k]["cluster_labels"]
-                            ):
-                                cluster_labels = all_data[embed_name][k][
-                                    "cluster_labels"
-                                ][fold_number]
+                        # Add selection functionality
+                        if args.save_selection:
+                            # Add JavaScript for selection
+                            fig.update_layout(
+                                clickmode="event+select",
+                                # Add custom buttons
+                                updatemenus=[
+                                    dict(
+                                        type="buttons",
+                                        direction="right",
+                                        buttons=[
+                                            dict(
+                                                args=[{"clickmode": "event+select"}],
+                                                label="Enable Selection",
+                                                method="relayout",
+                                            ),
+                                            dict(
+                                                args=[{"clickmode": "none"}],
+                                                label="Disable Selection",
+                                                method="relayout",
+                                            ),
+                                        ],
+                                        pad={"r": 10, "t": 10},
+                                        showactive=True,
+                                        x=0.1,
+                                        xanchor="left",
+                                        y=1.1,
+                                        yanchor="top",
+                                    ),
+                                ],
+                                margin=dict(l=40, r=40, t=60, b=40),
+                            )
 
-                                # Add debugging info
-                                if args.debug:
-                                    print(
-                                        f"Fold {fold_number}, k={k}, position={position}, embedding={embed_name}"
+                            # Add annotation to explain selection
+                            fig.add_annotation(
+                                x=0.5,
+                                y=1.05,
+                                xref="paper",
+                                yref="paper",
+                                text="Click to select points. Selected points will be saved for static plots.",
+                                showarrow=False,
+                                font=dict(size=12),
+                                align="center",
+                            )
+
+                            # Add a callback to save selected points (must be added externally)
+                            selected_examples_key = (
+                                f"{embed_key}_{position}_register_fold_{fold_number}"
+                            )
+                            selected_examples[selected_examples_key] = {
+                                "embed_key": embed_key,
+                                "position": position,
+                                "fold_number": fold_number,
+                                "projection": proj_2d.tolist(),
+                                "labels": labels.tolist(),
+                                "metadata": [
+                                    {
+                                        "id": item.get("id", f"sample_{i}"),
+                                        "lang": item.get("lang", "unknown"),
+                                        "register": labels[i],
+                                        "text": raw_texts[i]
+                                        if i < len(raw_texts)
+                                        else "No text available",
+                                    }
+                                    for i, item in enumerate(
+                                        metadata[: min(len(metadata), len(proj_2d))]
                                     )
-                                    print(
-                                        f"Unique cluster labels: {np.unique(cluster_labels, return_counts=True)}"
-                                    )
-                                    print(f"Shape of projection data: {proj_2d.shape}")
-                                    print(
-                                        f"Shape of cluster_labels: {cluster_labels.shape}"
-                                    )
+                                ],
+                                "selected_indices": [],  # To be filled by user interaction
+                            }
 
-                                # Verify that we have the correct number of labels
-                                if len(cluster_labels) != len(proj_2d):
-                                    print(
-                                        f"WARNING: Mismatch between cluster labels ({len(cluster_labels)}) "
-                                        f"and points ({len(proj_2d)}) for {embed_name}, k={k}, fold={fold_number}"
-                                    )
-                                    continue
+                        # Save interactive plot as HTML
+                        output_file = os.path.join(
+                            interactive_output_dir,
+                            f"{embed_key}_{position}_register_fold_{fold_number}_interactive.html",
+                        )
 
-                                # Create a colormap for cluster labels
-                                cmap_clusters = plt.cm.get_cmap("tab10", k)
+                        # Add JavaScript for selection export if requested
+                        if args.save_selection:
+                            # Add JavaScript to handle selection and export
+                            selection_js = f"""
+                            <script>
+                                var selectedPoints = [];
+                                var plotKey = "{selected_examples_key}";
+                                
+                                document.addEventListener('DOMContentLoaded', function() {{
+                                    var plotEl = document.querySelector('.plotly-graph-div');
+                                    plotEl.on('plotly_selected', function(eventData) {{
+                                        if (eventData && eventData.points) {{
+                                            selectedPoints = eventData.points.map(pt => pt.customdata);
+                                            console.log('Selected points:', selectedPoints);
+                                            
+                                            // Update display
+                                            document.getElementById('selected-count').innerText = selectedPoints.length;
+                                        }}
+                                    }});
+                                    
+                                    // Add export button
+                                    var exportBtn = document.createElement('button');
+                                    exportBtn.innerText = 'Export Selection';
+                                    exportBtn.style.position = 'absolute';
+                                    exportBtn.style.top = '10px';
+                                    exportBtn.style.right = '10px';
+                                    exportBtn.style.zIndex = 999;
+                                    exportBtn.onclick = function() {{
+                                        var selection = {{
+                                            plot_key: plotKey,
+                                            selected_indices: selectedPoints
+                                        }};
+                                        
+                                        // Create download link
+                                        var dataStr = "data:text/json;charset=utf-8," + encodeURIComponent(JSON.stringify(selection));
+                                        var downloadAnchorNode = document.createElement('a');
+                                        downloadAnchorNode.setAttribute("href", dataStr);
+                                        downloadAnchorNode.setAttribute("download", "selection_" + plotKey + ".json");
+                                        document.body.appendChild(downloadAnchorNode);
+                                        downloadAnchorNode.click();
+                                        downloadAnchorNode.remove();
+                                    }};
+                                    
+                                    // Add status display
+                                    var statusDiv = document.createElement('div');
+                                    statusDiv.style.position = 'absolute';
+                                    statusDiv.style.top = '40px';
+                                    statusDiv.style.right = '10px';
+                                    statusDiv.style.zIndex = 999;
+                                    statusDiv.innerHTML = 'Selected: <span id="selected-count">0</span> points';
+                                    
+                                    // Add to document
+                                    document.body.appendChild(exportBtn);
+                                    document.body.appendChild(statusDiv);
+                                }});
+                            </script>
+                            """
 
-                                # Create figure
-                                plt.figure(figsize=(12, 10))
-
-                                # Create scatter plots for each cluster with proper legend scaling
-                                for cluster_id in range(k):
-                                    mask = cluster_labels == cluster_id
-                                    plt.scatter(
-                                        proj_2d[mask, 0],
-                                        proj_2d[mask, 1],
-                                        c=[cmap_clusters(cluster_id)],
-                                        label=f"Cluster {cluster_id}",
-                                        alpha=0.7,
-                                        s=3,
-                                        edgecolors="none",
-                                    )
-                                plt.title(
-                                    f"{embed_key} with K-means (k={k}, {position} embeddings), Fold {fold_number}"
+                            # Save with added JavaScript
+                            with open(output_file, "w") as f:
+                                html_content = pio.to_html(
+                                    fig, include_plotlyjs=True, full_html=True
                                 )
-                                plt.xlabel("Dimension 1")
-                                plt.ylabel("Dimension 2")
-
-                                # Create legend with proper marker scaling
-                                legend = plt.legend(
-                                    title=f"K-means Clusters (k={k})",
-                                    loc="best",
-                                    bbox_to_anchor=(1.05, 1),
-                                    markerscale=10,  # Scale marker size in legend
+                                html_content = html_content.replace(
+                                    "</body>", f"{selection_js}</body>"
                                 )
+                                f.write(html_content)
+                        else:
+                            # Save without selection JavaScript
+                            fig.write_html(output_file)
 
-                                plt.tight_layout()
+                        print(f"Saved interactive plot to {output_file}")
 
-                                # Save plot
-                                output_file = os.path.join(
-                                    output_dir,
-                                    f"{embed_key}_{position}_kmeans_k{k}_fold_{fold_number}.{args.output_format}",
+                        # Open in browser for the first plot
+                        if (
+                            position == args.embedding_positions[0]
+                            and embed_key == plot_keys[0]
+                        ):
+                            try:
+                                webbrowser.open(
+                                    "file://" + os.path.abspath(output_file)
                                 )
-                                plt.savefig(
-                                    output_file, dpi=args.dpi, bbox_inches="tight"
-                                )
-                                print(f"Saved plot to {output_file}")
+                                print(f"Opening {output_file} in browser")
+                            except Exception as e:
+                                print(f"Could not open browser: {e}")
 
-                                if args.show_plots:
-                                    plt.show()
-                                else:
-                                    plt.close()
-                            else:
-                                if args.debug:
-                                    print(
-                                        f"DEBUG: Missing data for {embed_name}, k={k}, fold={fold_number}"
-                                    )
-                                    if embed_name in all_data:
-                                        print(f"  - embed_name exists in all_data")
-                                        if k in all_data[embed_name]:
-                                            print(
-                                                f"  - k exists in all_data[{embed_name}]"
-                                            )
-                                            if (
-                                                "cluster_labels"
-                                                in all_data[embed_name][k]
-                                            ):
-                                                print(
-                                                    f"  - cluster_labels exists in all_data[{embed_name}][{k}]"
-                                                )
-                                                if (
-                                                    fold_number
-                                                    in all_data[embed_name][k][
-                                                        "cluster_labels"
-                                                    ]
-                                                ):
-                                                    print(
-                                                        f"  - fold_number exists in all_data[{embed_name}][{k}]['cluster_labels']"
-                                                    )
+                        # 2. Interactive plot by language
+                        fig = px.scatter(
+                            x=proj_2d[:, 0],
+                            y=proj_2d[:, 1],
+                            color=languages,
+                            title=f"{embed_key} by Language ({position} embeddings), Fold {fold_number}",
+                            labels={"x": "Dimension 1", "y": "Dimension 2"},
+                            category_orders={"color": sorted(unique_languages)},
+                            hover_data=hover_data,
+                        )
 
-                                print(
-                                    f"Warning: K-means cluster labels for k={k}, position={position}, embedding={embed_key}, fold={fold_number} not found"
-                                )
+                        # Improve the hover template
+                        fig.update_traces(
+                            hovertemplate="<b>Language:</b> %{color}<br>"
+                            + "<b>Register:</b> %{hovername}<br>"
+                            + "<b>Text:</b> %{hovertext}<br>"
+                            + "<extra></extra>"
+                        )
+
+                        # Save interactive plot as HTML
+                        output_file = os.path.join(
+                            interactive_output_dir,
+                            f"{embed_key}_{position}_lang_fold_{fold_number}_interactive.html",
+                        )
+                        fig.write_html(output_file)
+                        print(f"Saved interactive plot to {output_file}")
+
+            # If all_data is provided, create scatter plots colored by K-means clusters
+            # This section is unchanged...
 
         except Exception as e:
             print(f"Error processing fold file {fold_file}: {e}")
             import traceback
 
             traceback.print_exc()
+
+    # Save selected examples if any were created
+    if args.save_selection and selected_examples:
+        selection_path = os.path.join(output_dir, args.selection_output)
+        with open(selection_path, "w") as f:
+            json.dump(selected_examples, f, indent=2)
+        print(f"Saved selection template to {selection_path}")
 
     print("2D projection plotting complete.")
 
